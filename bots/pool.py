@@ -38,17 +38,23 @@ class Pool:
                 return (f, t, r), a, b
 
 
-def score_flop(seed): # Everything for one flop: its turns and rivers, every hand's rank, and draws
+def score_flop(seed): # Everything for one random flop: its turns and rivers, every hand's rank, and draws
     rng = np.random.default_rng(seed)
     flop = rng.choice(52, size=3, replace=False)
-    turns = rng.choice(np.setdiff1d(np.arange(52), flop), size=TURNS, replace=False)
-    rivers = np.zeros((TURNS, RIVERS), dtype=np.int8)
-    rank = np.full((TURNS, RIVERS, len(COMBOS)), -1, dtype=np.int16)
-    strength = np.full((TURNS, RIVERS, len(COMBOS)), np.nan, dtype=np.float32)
-    for t, turn in enumerate(turns):
-        rivers[t] = rng.choice(np.setdiff1d(np.arange(52), np.append(flop, turn)), size=RIVERS, replace=False)
-        for r, river in enumerate(rivers[t]):
-            board = [*flop, turn, river]
+    return score_board(flop, None, None, rng)
+
+
+def score_board(flop, turn, river, rng, turns=TURNS, rivers_per_turn=RIVERS): # Score a flop; unknown turn/river cards are sampled
+    turn_cards = np.array([turn]) if turn is not None else rng.choice(np.setdiff1d(np.arange(52), flop), size=turns, replace=False)
+    n_rivers = 1 if river is not None else rivers_per_turn
+    rivers = np.zeros((len(turn_cards), n_rivers), dtype=np.int8)
+    rank = np.full((len(turn_cards), n_rivers, len(COMBOS)), -1, dtype=np.int16)
+    strength = np.full((len(turn_cards), n_rivers, len(COMBOS)), np.nan, dtype=np.float32)
+    for t, turn_card in enumerate(turn_cards):
+        rivers[t] = [river] if river is not None else rng.choice(
+            np.setdiff1d(np.arange(52), np.append(flop, turn_card)), size=n_rivers, replace=False)
+        for r, river_card in enumerate(rivers[t]):
+            board = [*flop, turn_card, river_card]
             live = [k for k, (i, j) in enumerate(COMBOS) if i not in board and j not in board]
             cards = [CARDS[i] for i in board]
             ranks = [best_hand([CARDS[COMBOS[k][0]], CARDS[COMBOS[k][1]]] + cards) for k in live]
@@ -62,7 +68,15 @@ def score_flop(seed): # Everything for one flop: its turns and rivers, every han
             strength[t, r, live] = (below + 0.5 * ties) / len(live)
     draw = lambda board: np.array([DRAWS[draw_type([CARDS[i], CARDS[j]], [CARDS[b] for b in board])]
                                    if i not in board and j not in board else 0 for i, j in COMBOS], dtype=np.int8)
-    return flop, turns, rivers, rank, strength, draw(flop), np.array([draw([*flop, t]) for t in turns])
+    return flop, turn_cards, rivers, rank, strength, draw(flop), np.array([draw([*flop, t]) for t in turn_cards])
+
+
+def equities(strength): # Flop and turn equity: each hand's average strength over the runouts below it
+    with warnings.catch_warnings():  # hands that use a board card have no equity there; that's expected
+        warnings.simplefilter("ignore", RuntimeWarning)
+        turn = np.nanmean(strength, axis=-2)
+        flop = np.nanmean(strength.reshape(*strength.shape[:-3], -1, strength.shape[-1]), axis=-2)
+    return flop, turn
 
 
 def played_weights():
@@ -75,10 +89,7 @@ def build(seed=1):
     with Workers() as workers:
         parts = workers.map(score_flop, range(seed * 100_000, seed * 100_000 + FLOPS), chunksize=4)
     flops, turns, rivers, rank, strength, flop_draw, turn_draw = (np.array(x) for x in zip(*parts))
-    with warnings.catch_warnings():  # hands that use a board card have no equity there; that's expected
-        warnings.simplefilter("ignore", RuntimeWarning)
-        turn_equity = np.nanmean(strength, axis=2)
-        flop_equity = np.nanmean(strength.reshape(FLOPS, -1, len(COMBOS)), axis=1)
+    flop_equity, turn_equity = equities(strength)
     print(f"  scored {FLOPS * TURNS * RIVERS:,} boards in {time.time() - start:.0f}s")
     return dict(flops=flops, turns=turns, rivers=rivers, rank=rank, river_strength=strength.astype(np.float16),
                 turn_equity=turn_equity, flop_equity=flop_equity, flop_draw=flop_draw, turn_draw=turn_draw,
