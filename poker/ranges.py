@@ -5,7 +5,7 @@ from itertools import combinations
 
 from .deck import Deck
 from .equity import RandomOpponents, key, pot_share
-from .evaluator import best_hand
+from .evaluator import category, hand_value
 from .profiles import DRAWS, NO_READ, bet_weights, call_weights, soft_keep
 from .tables import hand_label, load_table
 
@@ -128,7 +128,7 @@ class Range:
     def strengths(self, board): # Share of all live hands each combo beats or ties on this board
         on_board = {key(b) for b in board}
         is_live = lambda c: key(c[0]) not in on_board and key(c[1]) not in on_board
-        rank_of = {i: best_hand(c + board) for i, c in enumerate(self.combos) if is_live(c)}
+        rank_of = {i: hand_value(c + board) for i, c in enumerate(self.combos) if is_live(c)}
         ranks = sorted(rank_of.values())
         out = []
         for i in range(len(self.combos)):
@@ -175,25 +175,25 @@ class Range:
         self.history.append(f"{label} on the {street}")
 
     def river_equity(self, hole, board): # Exact equity vs this range, heads-up
-        mine = best_hand(hole + board)
+        mine = hand_value(hole + board)
         blocked = {key(c) for c in hole}
         num = den = 0.0
         for c, w in zip(self.combos, self.weights):
             if w == 0 or key(c[0]) in blocked or key(c[1]) in blocked:
                 continue
-            num += w * pot_share(mine, [best_hand(c + board)])
+            num += w * pot_share(mine, [hand_value(c + board)])
             den += w
         return num / den if den else float("nan")
 
     def breakdown(self, hole, board): # Hand categories, and how many beat you
-        mine = best_hand(hole + board)
+        mine = hand_value(hole + board)
         blocked = {key(c) for c in hole}
         cats, beats, ties, total = {}, 0.0, 0.0, 0.0
         for c, w in zip(self.combos, self.weights):
             if w == 0 or key(c[0]) in blocked or key(c[1]) in blocked:
                 continue
-            r = best_hand(c + board)
-            cats[CATEGORY[r[0]]] = cats.get(CATEGORY[r[0]], 0) + w
+            r = hand_value(c + board)
+            cats[CATEGORY[category(r)]] = cats.get(CATEGORY[category(r)], 0) + w
             total += w
             if r > mine:
                 beats += w

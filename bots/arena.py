@@ -9,66 +9,98 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 
 import numpy as np
 
-from bots.ml_agent import STREETS, Spot, lineup
+from bots.ml_agent import PREFLOP_SIZES, STREETS, Spot, lineup
 from bots.pool import load
-from poker.profiles import PRESETS, bet_weights, call_weights, random_profile
+from poker.profiles import PRESETS, bet_weights, call_weights, preflop_weights, raise_weights, random_profile
 from poker.prompts import again, ask, interactive_loop, yes
 
-POT, STACK = 6.0, 100.0  # bb in the pot on the flop (3 each), and starting stacks
+BLINDS, STACK = (0.5, 1.0), 100.0  # small and big blind, starting stacks (bb)
 BUCKETS = [(0, 25), (25, 50), (50, 100), (100, 200), (200, 500), (500, 1000), (1000, 2000), (2000, 5000)]
+SITUATIONS = ("vs_raise", "vs_3bet")   # the preflop spot a raise leaves the other player in, by raises so far
 
 
-def their_bets(profile, strength, draw, size, street, u): # Does the opponent bet? (same rules the bots range with)
-    return u < float(bet_weights(np.array([strength]), np.array([draw]), size, street, profile)[0])
+def their_move(profile, pool, board, theirs, street, pot, to_call, can_raise, aggressions, dice):
+    # The opponent's choice, from the same rules the bots range with. Returns (move, chips put in now)
+    u = next(dice)
+    if street == "preflop":
+        situation = ("vs_limp" if to_call == 0 else "open") if aggressions == 0 else SITUATIONS[aggressions - 1]
+        w = {k: float(np.ravel(v)[0]) for k, v in preflop_weights(np.array([pool.preflop_pct[theirs]]), situation, profile).items()}
+        if can_raise and u < w["raise"]:
+            size = PREFLOP_SIZES[SITUATIONS[aggressions]]
+            return ("raise" if to_call else "bet"), to_call + size * (pot + to_call)
+        if u < w["raise"] + w["call"] or to_call == 0:
+            return ("call" if to_call else "check"), to_call
+        return "fold", 0.0
+    idx = {"flop": board[:1], "turn": board[:2], "river": board}[street]
+    s = np.array([float(np.nan_to_num(pool.strength[street][idx][theirs]))])
+    d = np.array([int(pool.draws[street][idx][theirs]) if street != "river" else 0])
+    if to_call == 0:
+        if can_raise and u < float(bet_weights(s, d, profile.bet_size, street, profile)[0]):
+            return "bet", profile.bet_size * pot
+        return "check", 0.0
+    facing = to_call / (pot - to_call)
+    r = float(raise_weights(s, d, facing, street, profile)[0]) if can_raise else 0.0
+    c = float(call_weights(s, d, facing, street, profile)[0])
+    if u < r:
+        return "raise", to_call + 1.0 * (pot + to_call)
+    if u < r + (1 - r) * c:
+        return "call", to_call
+    return "fold", 0.0
 
 
-def their_calls(profile, strength, draw, size, street, u):
-    return u < float(call_weights(np.array([strength]), np.array([draw]), size, street, profile)[0])
-
-
-def play_hand(agent, profile, pool, world, own, we_act_first): # One hand, flop to river. Returns our net bb
+def play_hand(agent, profile, pool, world, own, we_are_small_blind): # One hand, preflop to river. Returns our net bb
     board, mine, theirs = pool.deal(world)
-    dice = iter(world.random(12))   # the opponent's random choices, drawn up front so every bot faces the same ones
+    dice = iter(world.random(40))  # the opponent's random choices, drawn up front so every bot faces the same ones
     agent.new_hand(pool, board, mine)
-    pot, ours, behind = POT, POT / 2, STACK - POT / 2  # pot, what we've put in, what each player has left
-    shown = []                                          # their bets as (strength, draw), learned from at showdown
+    us_first = we_are_small_blind
+    put = {"us": BLINDS[0] if us_first else BLINDS[1], "them": BLINDS[1] if us_first else BLINDS[0]}
+    behind = {p: STACK - put[p] for p in put}
+    shown = []  # their bets and raises after the flop, as (strength, draw), learned from at showdown
     for street in STREETS:
-        spot = Spot(pool, board, street, mine, pot, ours, behind)
-        idx = spot.index()
-        s = float(np.nan_to_num(pool.strength[street][idx][theirs]))
-        d = int(pool.draws[street][idx][theirs]) if street != "river" else 0
-        rolls = [next(dice) for _ in range(4)]
-        order = ["us", "them"] if we_act_first else ["them", "us"]
-        for turn, who in enumerate(order):  # the first player acts; if they check, the second can bet
-            if behind <= 0:
-                break
-            if who == "us":
-                bet = agent.act(spot, behind)
-                if bet:
-                    size = bet / pot
-                    called = their_calls(profile, s, d, size, street, rolls[2 + turn])
-                    agent.saw_response(called)
-                    if not called:
-                        return pot - ours
-                    agent.see(spot, "call", size)
-                    pot, ours, behind = pot + 2 * bet, ours + bet, behind - bet
-                    break
-                if turn == 0:
-                    continue
+        order = ["us", "them"] if (street == "preflop") == us_first else ["them", "us"]
+        cur = dict(put) if street == "preflop" else {"us": 0.0, "them": 0.0}  # chips in on this street
+        aggressions, acted, i, we_just_bet = 0, set(), 0, False
+        while min(behind.values()) > 0 or cur["us"] != cur["them"]:
+            p, other = order[i % 2], order[(i + 1) % 2]
+            to_call = min(cur[other] - cur[p], behind[p])
+            pot = sum(put.values())
+            can_raise = aggressions < 2 and behind[other] > 0 and behind[p] > to_call
+            if p == "us":
+                spot = Spot(pool, board, street, mine, pot, put["us"], behind["us"])
+                situation = SITUATIONS[min(aggressions, 1)]
+                move, added = agent.decide(spot, to_call, can_raise, situation, own)
             else:
-                size = profile.bet_size
-                bet = min(size * pot, behind)
-                if their_bets(profile, s, d, size, street, rolls[turn]):
-                    shown.append((s, d))
-                    agent.see(spot, "bet", bet / pot)
-                    if not agent.respond(spot, bet, own):
-                        return -ours
-                    pot, ours, behind = pot + 2 * bet, ours + bet, behind - bet
-                    break
-                agent.see(spot, "check")
+                move, added = their_move(profile, pool, board, theirs, street, pot, to_call, can_raise, aggressions, dice)
+                added = min(added, behind["them"])
+                spot = Spot(pool, board, street, mine, pot)
+                situation = ("vs_limp" if to_call == 0 else "open") if aggressions == 0 else SITUATIONS[aggressions - 1]
+                if street != "preflop" and move in ("bet", "raise"):
+                    idx = {"flop": board[:1], "turn": board[:2], "river": board}[street]
+                    shown.append((float(np.nan_to_num(pool.strength[street][idx][theirs])),
+                                  int(pool.draws[street][idx][theirs]) if street != "river" else 0))
+                if move != "fold":
+                    agent.see(spot, move, added / pot, to_call / max(pot - to_call, 1e-9), situation)
+            if p == "them" and we_just_bet:  # how they answered our bet or raise
+                agent.saw_response(move != "fold")
+            if move == "fold":
+                return -put["us"] if p == "us" else sum(put.values()) - put["us"]
+            put[p] += added
+            cur[p] += added
+            behind[p] -= added
+            we_just_bet = p == "us" and move in ("bet", "raise")
+            aggressions += move in ("bet", "raise")
+            acted.add(p)
+            i += 1
+            if move in ("check", "call") and len(acted) == 2 and cur["us"] == cur["them"]:
+                break
+            if move == "call" and min(behind.values()) == 0:
+                break
+        if min(behind.values()) == 0:
+            continue  # someone is all in: deal the rest, no more betting
     diff = int(pool.rank[board][mine]) - int(pool.rank[board][theirs])
     agent.showdown(shown)
-    return (pot if diff > 0 else pot / 2 if diff == 0 else 0) - ours
+    total = sum(put.values())
+    return (total if diff > 0 else total / 2 if diff == 0 else 0) - put["us"]
 
 
 def play(agent, pool, hands, session_len, seed, presets=PRESETS): # One bot vs a new random opponent every session
@@ -80,7 +112,7 @@ def play(agent, pool, hands, session_len, seed, presets=PRESETS): # One bot vs a
         if i % session_len == 0:
             profile = random_profile(profile_rng, presets)
             agent.new_opponent(profile)
-        net = play_hand(agent, profile, pool, world, own, we_act_first=i % 2 == 0)
+        net = play_hand(agent, profile, pool, world, own, we_are_small_blind=i % 2 == 0)
         agent.finish_hand(net)
         results.append((i % session_len, profile.name, net))
     return results
@@ -98,18 +130,18 @@ def _play_block(job): # One worker: play a block of sessions, return results and
     if hasattr(agent, "rng"):
         agent.rng = np.random.default_rng(seed)  # each worker explores with its own dice
     results = play(agent, _POOL, hands, session_len, seed, presets)
-    return results, getattr(agent, "call_data", []), getattr(agent, "bet_data", [])
+    return results, getattr(agent, "data", [])
 
 
 def play_parallel(workers, make, hands, session_len, seed, presets=PRESETS): # play() split across every core
+    # returns (results, what the bot learned from)
     # make: a function that builds a fresh bot (e.g. functools.partial(Agent, "learner")); same seed -> same hands
     sessions = max(1, hands // session_len)
     blocks = min(os.cpu_count(), sessions)
     sizes = [(sessions // blocks + (i < sessions % blocks)) * session_len for i in range(blocks)]  # sessions shared evenly
     sizes[-1] += hands - sum(sizes)
     parts = workers.map(_play_block, [(make, n, session_len, seed * 1000 + i, presets) for i, n in enumerate(sizes)])
-    results = [r for part in parts for r in part[0]]
-    return results, [x for part in parts for x in part[1]], [x for part in parts for x in part[2]]
+    return [r for part in parts for r in part[0]], [x for part in parts for x in part[1]]
 
 
 def bb100(nets): # Win rate in bb per 100 hands, with a 95% CI half-width

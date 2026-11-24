@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .deck import Deck
-from .evaluator import best_hand
+from .evaluator import hand_value
 from .tables import hand_label
 
 Z_95 = 1.96
@@ -97,7 +97,7 @@ def run_hands(hole_cards, board, num_opponents, num_simulations, model=None): # 
         hands, dealt = model.deal(live, num_opponents)
         used = {key(c) for c in dealt}
         runout = board + random.sample([c for c in live if key(c) not in used], cards_needed)
-        shares[i] = pot_share(best_hand(mine + runout), [best_hand(h + runout) for h in hands])
+        shares[i] = pot_share(hand_value(mine + runout), [hand_value(h + runout) for h in hands])
         uncontested += not hands
         opponents += len(hands)
     return shares, uncontested / num_simulations, opponents / num_simulations

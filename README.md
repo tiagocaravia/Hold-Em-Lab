@@ -34,10 +34,12 @@ Every script asks for its inputs if you run it with no options. After each resul
 Needs Python 3.10 or newer.
 
 ```bash
-pip install matplotlib pandas scikit-learn
+pip install matplotlib pandas scikit-learn phevaluator
 ```
 
 (numpy and Pillow, used by the convergence animation, come with these.)
+
+`phevaluator` is a compiled hand evaluator, about 50× faster than the Python one in `poker/evaluator.py`. Everything uses it when it's installed and falls back to the Python evaluator when it isn't, with identical results: the two agreed on who wins and on the hand category in 300,000 random matchups. The Python evaluator stays as the readable reference.
 
 ---
 
@@ -171,11 +173,11 @@ python3 bots/arena.py                      # asks you questions
 python3 bots/arena.py --hands 100000 --session 1000 --save arena.png
 ```
 
-**The game:** heads-up from the flop to the river, with 6bb in the pot and 100bb stacks. On each street the first player checks or bets ½, ¾ or 1¼ pot; the other calls or folds, or bets if checked to. No raises yet. Players take turns acting first. Each opponent plays one session (1,000 hands by default) and is a randomly nudged version of a preset profile: nit, regular, calling station or maniac. The bot meets every new opponent knowing nothing about them.
+**The game:** heads-up no-limit hold'em, preflop to river. Blinds are 0.5 and 1bb, stacks 100bb. The small blind acts first preflop and last after the flop. Preflop a player can fold, limp, raise (to 2.5bb) or 3-bet (to 3×), then call or fold a 3-bet. After the flop, on each street a player checks or bets ½, ¾ or 1¼ pot, and facing a bet can fold, call or raise. That's two aggressive actions per street (bet and raise, or raise and 3-bet), with no 4-bets yet. Positions alternate every hand. Each opponent plays one session (1,000 hands by default) and is a randomly nudged version of a preset profile: nit, regular, calling station or maniac. The bot meets every new opponent knowing nothing about them.
 
-**One set of rules:** opponents are `Profile`s from `poker/profiles.py`, the same description `advise.py` uses. Their choices come from the same betting and calling rules the bots and `advise.py` use to range them, so what a bot assumes about a player and how that player actually behaves line up.
+**One set of rules:** opponents are `Profile`s from `poker/profiles.py`, the same description `advise.py` uses. Their choices (preflop actions, bets, calls and raises) come from the same rules the bots and `advise.py` use to range them, so what a bot assumes about a player and how that player actually behaves line up.
 
-**Real cards, fast:** the first run scores every possible hand on 10,800 real boards (300 flops × 6 turns × 6 rivers), in parallel, in about 90 seconds, cached in `bots/cache/`. On the flop and turn a hand's strength is its equity over the runouts still to come, and draws are flagged. The bots range their opponent on every street, blockers included. 100,000 hands take about 75 seconds per bot.
+**Real cards, fast:** the first run scores every possible hand on 10,800 real boards (300 flops × 6 turns × 6 rivers) and builds a preflop table of every hand's equity against every other hand from 4,000 independent random boards. That takes about 40 seconds in parallel with `phevaluator`, and it's cached in `bots/cache/`. The preflop table matches published equities to within about half a point (AA vs a random hand: 85.4%, published 85.2%). On the flop and turn a hand's strength is its equity over the runouts still to come, and draws are flagged. The bots range their opponent on every street, preflop included, blockers included. 100,000 hands take about 45 seconds per bot.
 
 **Bot versions** (the hand-built bot in `bots/ml_agent.py`), all playing exactly the same deals and opponent choices:
 
@@ -184,17 +186,17 @@ python3 bots/arena.py --hands 100000 --session 1000 --save arena.png
 * **learner + mixing:** randomizes in CLOSE spots
 * **oracle:** knows the opponent's exact profile, but still plays the hand-built rules
 
-**Results** (100,000 hands, new opponent every 1,000):
+**Results** (40,000 hands, new opponent every 1,000):
 
 | bb/100 | no read | learner | learner + mixing | oracle |
 |---|---|---|---|---|
-| all | +555 | +620 | +618 | +806 |
-| vs nits | +57 | +63 | +63 | +226 |
-| vs calling stations | +996 | +1,300 | +1,300 | +1,542 |
+| all | +214 | +209 | +241 | +294 |
+| vs nits | +43 | −3 | −15 | +88 |
 
-* The win rates are huge because these opponents are simple rules that never raise: over three streets with 100bb stacks they pay off value bets and bluff into calls. A bot that never bets and calls everything loses about 560 bb/100 against them, so the accounting is sound. The meaningful number is each bot's **edge over "no read" on the same hands**, which the arena reports with a 95% interval.
-* The learner is +66 ± 12 bb/100 ahead of "no read" and clearly ahead from about **hand 25** against a new opponent, mostly against calling stations.
-* The oracle is another +190 bb/100 ahead, especially against nits. That gap is what the ML bot gets to work on.
+* Even "no read" profits, because these opponents are simple rules: they fold too much preflop and call too much after. A bot that checks when it can and folds to any bet loses about 38 bb/100 (its blinds), so the accounting is sound. The meaningful number is each bot's **edge over "no read" on the same hands**, which the arena reports with a 95% interval.
+* The oracle is +80 ± 18 bb/100 ahead of "no read".
+* **Mixing now helps** (+27 ± 17): with raises in the game, a predictable calling pattern costs more.
+* **The learner doesn't help yet** (−5 ± 11), and against nits it does worse than "no read". Its call-rate read was also counting preflop folds, which made it bluff too much after the flop. Fixing that took it from −34 to −5, but something in its reads still misjudges nits. That's the first thing to look at in the input review.
 
 The plot shows cumulative profit for each bot, and each bot's edge over "no read" by how many hands into a new opponent it is.
 
@@ -210,7 +212,7 @@ python3 bots/train.py --rounds 5 --resume  # keep training the saved bot
 
 **Fast:** hands are played on every CPU core at once. Each core plays its own block of opponents, with seeds fixed so every bot version still faces exactly the same hands. The models stop adding trees once more trees stop helping on held-back data, which keeps predictions fast and avoids fitting noise.
 
-The ML bot (`MLAgent` in `bots/ml_agent.py`) plays every street with two gradient-boosted models (scikit-learn's `HistGradientBoostingRegressor`): one for calling a bet, one for checking or betting ½, ¾ or 1¼ pot. Each option's value is the hand-built value plus a **learned correction**, so the models learn where the guidance is wrong rather than relearning poker. Their inputs include the street, hand strength, equity vs the ranged opponent, the bet size, the pot and stack sizes, the hand-built value (and for bets, its fold chance and equity when called), and reads on this opponent, including how often they call each bet size.
+The ML bot (`MLAgent` in `bots/ml_agent.py`) makes every decision, from preflop to the river, with one gradient-boosted model (scikit-learn's `HistGradientBoostingRegressor`). For each legal option (check, call, or a bet or raise of each size) it takes the hand-built value of that option and adds a **learned correction**, then picks the best; folding is worth 0. So the model learns where the guidance is wrong rather than relearning poker. Its inputs include the street, hand strength, equity vs the ranged opponent, the bet to call, the option's size, the pot and stack sizes, the hand-built value (and for bets and raises, its fold chance and equity when called), and reads on this opponent, including how often they call each bet size.
 
 **The reward** for each decision is what the rest of the hand won from that point: the hand's final profit plus what was already in the pot. So a flop bet gets credit or blame for how the whole hand played out, which is how it can learn things the hand-built value can't see, like a semi-bluff that wins on the river.
 
@@ -220,26 +222,56 @@ Training works in rounds:
 2. **Retrain** both models on everything collected so far.
 3. **Test** a frozen copy on held-out hands against held-out opponents, including a "tricky" type it never trains against.
 
-Results (15 rounds × 50,000 hands = 750,000 training hands, about 15 minutes on 15 cores):
+Results on the full preflop-to-river game (15 rounds × 50,000 hands = 750,000 training hands, about 15 minutes on 15 cores):
 
 | Training hands | ML bot (bb/100) | Edge over the hand-built learner |
 |---|---|---|
-| 50,000 | +480 | −0.2 ± 25.7 |
-| 200,000 | +522 | +42.3 ± 26.5 |
-| 400,000 | +549 | +69.0 ± 27.2 |
-| 600,000 | +567 | **+86.4 ± 26.8** |
-| 750,000 | +559 | +79.3 ± 26.8 |
+| 50,000 | +99 | −81 ± 27 |
+| 150,000 | +178 | −2 ± 30 |
+| 250,000 | +289 | +108 ± 34 |
+| 500,000 | +343 | +163 ± 35 |
+| 750,000 | **+366** | **+185 ± 35** |
 
-It matches the learner after 50,000 hands, pulls clearly ahead by 200,000, and levels off at about +80 bb/100 from around 600,000 hands. More hands alone won't add much now; the next gains have to come from better inputs or a richer game. It beats the learner against every opponent type, including "tricky", the type it never trained on (+289 vs +249). The oracle is still about 110 bb/100 ahead, mostly against nits and "tricky".
+| Test opponents (bb/100) | ML bot | no read | learner | oracle |
+|---|---|---|---|---|
+| all | **+366** | +173 | +180 | +231 |
+| maniac | +693 | +216 | +259 | +284 |
+| calling station | +555 | +353 | +378 | +487 |
+| tricky (never trained on) | +208 | +122 | +115 | +176 |
+| nit | +41 | +39 | −10 | +95 |
 
-To watch it learn, add `--animate training.gif` (10 rounds of 10,000 hands works well: `--rounds 10 --hands 10000`). Each frame is one round and shows:
+It starts well behind the hand-built bots, passes them after about 200,000 hands, and is still creeping up at 750,000. It beats the oracle overall because the oracle still plays hand-built rules, and with preflop play and raises there's far more for a learned strategy to improve on. It plays far more hands preflop than the guidance would (mostly calling, raising only its best hands), and it punishes the maniac's raises. Some of that is likely specific to these rule-based opponents, which fold too much preflop and never 4-bet, so read it as "beats these opponents", not "plays well against people". Nits are the one type where it barely beats "no read", and the hand-built learner's reads are weakest against them too. The trained bot is saved in `bots/cache/`.
+
+To watch it learn, add `--animate training.gif`. Each frame is one round and shows:
 
 * its win rate and its edge over the hand-built learner so far;
-* what it does when it acts first, at each hand strength (check, or bet ½, ¾ or 1¼ pot);
-* how often it calls a bet, at each hand strength, next to the hand-built guidance it started from;
-* which inputs each model relies on.
+* what it does when checked to after the flop (check, or bet ½, ¾ or 1¼ pot), when facing a bet (fold, call or raise), and preflop, each by hand strength;
+* which inputs the model relies on.
 
 Every round replays the same fixed set of spots, so the changes come from what it learned, not from new cards.
+
+### Plugging the bot into a game
+
+`bots/interface.py` wraps the trained bot behind one call, so a game engine or a competition only needs a thin adapter:
+
+```python
+from bots.interface import Bot, GameState
+
+bot = Bot()  # loads the trained ML bot from bots/cache/, or the hand-built bot if none is saved
+move, chips = bot.act(GameState(
+    hole=["AS", "KH"], board=["QH", "JD", "2C"], pot=12, to_call=4, stack=94, opponent="player 2",
+    actions=[("preflop", "us", "raise", 2.0), ("preflop", "them", "call", 1.5), ("flop", "them", "bet", 4.0)]))
+# -> e.g. ("call", 4.0); moves are "fold", "check", "call", "bet" or "raise", with the chips to put in now
+bot.end_hand(their_hole=["9C", "9D"])  # or end_hand(opponent_folded=True): it learns from how the hand ended
+```
+
+* **`GameState`:** your cards and the board as text, the pot (including any bet you face), what you must add to call, your stack, and **every action this hand so far** as (street, "us" or "them", move, chips put in), blinds not included. From that list it works out who's in which blind and what each of their actions meant, just as the arena would.
+* **Every street, any board:** preflop uses the cached preflop table; after the flop it scores each new board as it appears, sampling the runouts on the flop. About 0.02 seconds per decision.
+* **Reads are kept per opponent name,** so it keeps learning about each player across hands.
+
+**Tested against the arena:** played through the interface, the bot makes exactly the same preflop decisions as when it's played directly. The first differences show up on the flop, where the interface samples its own runouts instead of using the pool's.
+
+`python3 bots/interface.py --opponent regular` plays arena hands with every decision going through `Bot.act()`. Its `ThroughInterface` class, which turns the engine's events into `GameState`s, is the template for a competition adapter.
 
 ### What the ML bot relies on
 
@@ -309,7 +341,8 @@ holdem-lab/
 │   ├── ml_agent.py            # the bot: hand-built versions + the ML bot
 │   ├── arena.py               # plays bot versions against random opponents
 │   ├── train.py               # trains the ML bot, tests on held-out opponents
-│   └── explain.py             # which inputs the ML bot relies on, training animation
+│   ├── explain.py             # which inputs the ML bot relies on, training animation
+│   └── interface.py           # the plug-in bot: Bot.act(GameState) for game engines and competitions
 ├── accuracy/                  # 4. accuracy
 │   ├── validate.py            # sim vs exact / published equity
 │   └── convergence.py         # how many sims is enough, with animation

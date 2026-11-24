@@ -13,7 +13,7 @@ import numpy as np
 from poker.prompts import again, ask, ask_cards, cards_from, interactive_loop, yes
 from poker.deck import Deck
 from poker.equity import run_hands
-from poker.evaluator import best_hand
+from poker.evaluator import hand_value
 from accuracy.convergence import Z_95, checkpoints, running_ci
 
 
@@ -40,10 +40,10 @@ def exact_equity(hole_cards, board): # Enumerate every runout
     wins = ties = losses = 0
     for runout in combinations(remaining, cards_needed):
         full_board = board + list(runout)
-        my_hand = best_hand(hole_cards + full_board)  # Same for every opponent hand on this runout
+        my_hand = hand_value(hole_cards + full_board)  # Same for every opponent hand on this runout
         left = [c for c in remaining if c not in runout]
         for opp in combinations(left, 2):
-            opp_hand = best_hand(list(opp) + full_board)
+            opp_hand = hand_value(list(opp) + full_board)
             if my_hand > opp_hand:
                 wins += 1
             elif my_hand == opp_hand:

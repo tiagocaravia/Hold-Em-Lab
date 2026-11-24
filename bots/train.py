@@ -33,8 +33,7 @@ def train(rounds, hands_per_round, test_hands, session_len, seed, show_plot=True
     bot = MLAgent()
     history, done = [], 0  # (training hands so far, ML result, edge over learner) per round
     if state:
-        bot.call_model, bot.bet_model = state["models"]
-        bot.call_data, bot.bet_data = state["call_data"], state["bet_data"]
+        bot.model, bot.data = state["model"], state["data"]
         history, done = state["history"], state["rounds"]
         print(f"Resuming: {done} rounds and {history[-1][0]:,} hands trained so far.")
     trained = history[-1][0] if history else 0
@@ -51,24 +50,21 @@ def train(rounds, hands_per_round, test_hands, session_len, seed, show_plot=True
             print(f"  {name:<10} {m:+7.1f} ± {h:.1f} bb/100")
 
         frames = [{"label": "round 0, the hand-built guidance it starts from", "models": None} if not state else
-                  {"label": f"resumed at {trained:,} hands", "models": state["models"], "trained": trained,
+                  {"label": f"resumed at {trained:,} hands", "models": state["model"], "trained": trained,
                    "test": history[-1][1], "edge": history[-1][2]}]  # for --animate
         print(f"\n  {'round':<6} {'trained on':>11} {'explore':>8}   {'ML bb/100':>15}   {'edge over learner':>19}")
         for r in range(done, done + rounds):
             start = time.time()
             explore = max(0.05, 0.30 * 0.6 ** r)  # explore a lot early, less later
-            models = (bot.call_model, bot.bet_model)
-            _, calls, bets = run(partial(MLAgent, explore=explore, models=models), hands_per_round, seed + r)
-            bot.call_data += calls
-            bot.bet_data += bets
+            _, data = run(partial(MLAgent, explore=explore, models=bot.model), hands_per_round, seed + r)
+            bot.data += data
             bot.train()
-            test = run(partial(MLAgent, explore=0.0, models=(bot.call_model, bot.bet_model)),
-                       test_hands, test_seed, TEST_PRESETS)[0]
+            test = run(partial(MLAgent, explore=0.0, models=bot.model), test_hands, test_seed, TEST_PRESETS)[0]
             m, h = bb100([x[2] for x in test])
             e, eh = edge(test, baselines["learner"])
             trained += hands_per_round
             history.append((trained, (m, h), (e, eh)))
-            frames.append({"label": f"round {r + 1}, {trained:,} hands trained", "models": (bot.call_model, bot.bet_model),
+            frames.append({"label": f"round {r + 1}, {trained:,} hands trained", "models": bot.model,
                            "trained": trained, "test": (m, h), "edge": (e, eh)})
             save_state(bot, history, r + 1)
             print(f"  {r + 1:<6} {trained:>11,} {explore:>8.2f}   {m:>+7.1f} ± {h:<5.1f}   "
@@ -96,9 +92,8 @@ def train(rounds, hands_per_round, test_hands, session_len, seed, show_plot=True
 
 def save_state(bot, history, rounds): # Everything needed to keep training later, saved after every round
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    joblib.dump({"models": (bot.call_model, bot.bet_model), "call_data": bot.call_data, "bet_data": bot.bet_data,
-                 "history": history, "rounds": rounds}, STATE_PATH, compress=3)
-    joblib.dump((bot.call_model, bot.bet_model), MODEL_PATH)
+    joblib.dump({"model": bot.model, "data": bot.data, "history": history, "rounds": rounds}, STATE_PATH, compress=3)
+    joblib.dump(bot.model, MODEL_PATH)
 
 
 def plot(history, baselines, save=None):
