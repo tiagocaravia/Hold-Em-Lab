@@ -9,52 +9,107 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 
 import numpy as np
 
-from bots.ml_agent import Spot, lineup
+from bots.ml_agent import STREETS, Spot, lineup
 from bots.pool import load
-from bots.profiles import random_profile
+from poker.profiles import PRESETS, bet_weights, call_weights, random_profile
 from poker.prompts import again, ask, interactive_loop, yes
 
-POT = 10.0  # bb in the pot when the river starts (5 from each player)
+POT, STACK = 6.0, 100.0  # bb in the pot on the flop (3 each), and starting stacks
 BUCKETS = [(0, 25), (25, 50), (50, 100), (100, 200), (200, 500), (500, 1000), (1000, 2000), (2000, 5000)]
 
 
-def play(agent, pool, hands, session_len, seed, presets=None): # One bot vs a new random opponent every session
-    world = np.random.default_rng(seed)   # deals, opponents, their randomness: identical for every bot
-    own = np.random.default_rng(seed + 1) # the bot's own mixing
+def their_bets(profile, strength, draw, size, street, u): # Does the opponent bet? (same rules the bots range with)
+    return u < float(bet_weights(np.array([strength]), np.array([draw]), size, street, profile)[0])
+
+
+def their_calls(profile, strength, draw, size, street, u):
+    return u < float(call_weights(np.array([strength]), np.array([draw]), size, street, profile)[0])
+
+
+def play_hand(agent, profile, pool, world, own, we_act_first): # One hand, flop to river. Returns our net bb
+    board, mine, theirs = pool.deal(world)
+    dice = iter(world.random(12))   # the opponent's random choices, drawn up front so every bot faces the same ones
+    agent.new_hand(pool, board, mine)
+    pot, ours, behind = POT, POT / 2, STACK - POT / 2  # pot, what we've put in, what each player has left
+    shown = []                                          # their bets as (strength, draw), learned from at showdown
+    for street in STREETS:
+        spot = Spot(pool, board, street, mine, pot, ours, behind)
+        idx = spot.index()
+        s = float(np.nan_to_num(pool.strength[street][idx][theirs]))
+        d = int(pool.draws[street][idx][theirs]) if street != "river" else 0
+        rolls = [next(dice) for _ in range(4)]
+        order = ["us", "them"] if we_act_first else ["them", "us"]
+        for turn, who in enumerate(order):  # the first player acts; if they check, the second can bet
+            if behind <= 0:
+                break
+            if who == "us":
+                bet = agent.act(spot, behind)
+                if bet:
+                    size = bet / pot
+                    called = their_calls(profile, s, d, size, street, rolls[2 + turn])
+                    agent.saw_response(called)
+                    if not called:
+                        return pot - ours
+                    agent.see(spot, "call", size)
+                    pot, ours, behind = pot + 2 * bet, ours + bet, behind - bet
+                    break
+                if turn == 0:
+                    continue
+            else:
+                size = profile.bet_size
+                bet = min(size * pot, behind)
+                if their_bets(profile, s, d, size, street, rolls[turn]):
+                    shown.append((s, d))
+                    agent.see(spot, "bet", bet / pot)
+                    if not agent.respond(spot, bet, own):
+                        return -ours
+                    pot, ours, behind = pot + 2 * bet, ours + bet, behind - bet
+                    break
+                agent.see(spot, "check")
+    diff = int(pool.rank[board][mine]) - int(pool.rank[board][theirs])
+    agent.showdown(shown)
+    return (pot if diff > 0 else pot / 2 if diff == 0 else 0) - ours
+
+
+def play(agent, pool, hands, session_len, seed, presets=PRESETS): # One bot vs a new random opponent every session
+    world = np.random.default_rng(seed)    # deals and opponents' choices: identical for every bot
+    own = np.random.default_rng(seed + 1)  # the bot's own mixing
     profile_rng = random.Random(seed)
-    results = []                          # (hand number within session, opponent type, net bb)
+    results = []                           # (hand number within session, opponent type, net bb)
     for i in range(hands):
         if i % session_len == 0:
-            profile = random_profile(profile_rng, presets) if presets else random_profile(profile_rng)
+            profile = random_profile(profile_rng, presets)
             agent.new_opponent(profile)
-        board, mine, theirs = pool.deal(world)
-        u = world.random()
-        spot = Spot(pool, board, mine, POT)
-        their_strength = float(pool.strength[board, theirs])
-        diff = int(pool.rank[board, mine]) - int(pool.rank[board, theirs])
-        showdown = lambda extra: (POT / 2 + extra) * (1 if diff > 0 else -1 if diff < 0 else 0)
-
-        if i % 2 == 0:  # we act first
-            bet = agent.wants_to_bet(spot)
-            if bet:
-                called = profile.calls(their_strength, bet / POT)
-                agent.saw_response(called)
-                net = showdown(bet) if called else POT / 2
-            else:
-                net = showdown(0)
-        else:           # they act first
-            if profile.bets(their_strength, u):
-                bet = profile.bet_size * POT
-                if agent.respond(spot, bet, own):
-                    agent.saw_their_bet(their_strength)
-                    net = showdown(bet)
-                else:
-                    net = -POT / 2
-            else:
-                net = showdown(0)
+        net = play_hand(agent, profile, pool, world, own, we_act_first=i % 2 == 0)
         agent.finish_hand(net)
         results.append((i % session_len, profile.name, net))
     return results
+
+
+_POOL = None  # each worker process loads the pool once
+
+
+def _play_block(job): # One worker: play a block of sessions, return results and anything the bot learned from
+    global _POOL
+    make, hands, session_len, seed, presets = job
+    if _POOL is None:
+        _POOL = load()
+    agent = make()
+    if hasattr(agent, "rng"):
+        agent.rng = np.random.default_rng(seed)  # each worker explores with its own dice
+    results = play(agent, _POOL, hands, session_len, seed, presets)
+    return results, getattr(agent, "call_data", []), getattr(agent, "bet_data", [])
+
+
+def play_parallel(workers, make, hands, session_len, seed, presets=PRESETS): # play() split across every core
+    # make: a function that builds a fresh bot (e.g. functools.partial(Agent, "learner")); same seed -> same hands
+    sessions = max(1, hands // session_len)
+    blocks = min(os.cpu_count(), sessions)
+    sizes = [(sessions // blocks + (i < sessions % blocks)) * session_len for i in range(blocks)]  # sessions shared evenly
+    sizes[-1] += hands - sum(sizes)
+    parts = workers.map(_play_block, [(make, n, session_len, seed * 1000 + i, presets) for i, n in enumerate(sizes)])
+    results = [r for part in parts for r in part[0]]
+    return results, [x for part in parts for x in part[1]], [x for part in parts for x in part[2]]
 
 
 def bb100(nets): # Win rate in bb per 100 hands, with a 95% CI half-width
@@ -98,9 +153,7 @@ def report(all_results, session_len):
     base = all_results.get("no read")
     if not base:
         return
-    for name in ("learner", "learner, no mixing"):
-        if name not in all_results:
-            continue
+    for name in [n for n in all_results if n != "no read"]:
         print(f"\n{name}: edge over 'no read' on the same hands (bb/100)")
         first = None
         for lo, hi in buckets:
@@ -118,7 +171,7 @@ def report(all_results, session_len):
 def plot(all_results, session_len, save=None):
     import matplotlib.pyplot as plt
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5.5))
-    fig.suptitle("Bot arena: river play vs random opponents", fontsize=13, fontweight="bold")
+    fig.suptitle("Bot arena: flop to river vs random opponents", fontsize=13, fontweight="bold")
     colors = {name: plt.cm.tab10(i) for i, name in enumerate(all_results)}  # same color in both panels
 
     for name, results in all_results.items():

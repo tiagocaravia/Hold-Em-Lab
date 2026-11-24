@@ -1,16 +1,15 @@
-import math
+import numpy as np
 import random
 from collections import Counter
-from dataclasses import dataclass
 from itertools import combinations
 
 from .deck import Deck
 from .equity import RandomOpponents, key, pot_share
 from .evaluator import best_hand
+from .profiles import DRAWS, NO_READ, bet_weights, call_weights, soft_keep
 from .tables import hand_label, load_table
 
 TABLE_SIZES = (3, 5, 7, 9)  # Preflop tables we have
-EDGE = 0.03                 # How soft range edges are
 CATEGORY = ["High card", "One pair", "Two pair", "Three of a kind", "Straight",
             "Flush", "Full house", "Four of a kind", "Straight flush"]
 
@@ -80,36 +79,10 @@ PREFLOP_ACTIONS = {
 }
 
 
-@dataclass
-class Tendencies: # How a player plays; defaults = no read
-    play_pct: float = 0.45         # plays the top 45% of hands (when we didn't see the action)
-    raise_pct: float = 0.20        # opens with the top 20% of hands
-    big_raise_pct: float = 0.06    # big raises / 3-bets with the top 6%
-    call_pct: float = 0.40         # calls/limps with hands inside the top 40%
-    slowplay: float = 0.35         # how often top hands just call preflop
-    bluff_share: float | None = None  # share of river bets that are bluffs; None = balanced
-    air_cutoff: float = 0.50       # river hands weaker than this are bluff candidates
-    medium_bet: float = 0.15       # how often in-between hands bet the river
-    flop_bluff: float = 0.40       # missed hands that bet the flop (c-bet bluffs)
-    turn_bluff: float = 0.25       # missed hands that bet the turn
-    semi_bluff: float = 0.60       # flush / open-ended straight draws that bet
-    gutshot_bet: float = 0.30      # gutshots that bet
-    early_medium_bet: float = 0.35 # in-between hands that bet the flop/turn
-    trap: float = 0.35             # strong hands that check instead of betting
-    float_call: float = 0.15       # missed hands that call a bet anyway
-
-
-NO_READ = Tendencies()
-
-
 def short_label(a, b): # AKo, AA, JTs
     hi, lo = sorted((a, b), key=lambda c: c.rank_value, reverse=True)
     name = "".join("T" if c.rank == "10" else c.rank for c in (hi, lo))
     return name if hi.rank == lo.rank else name + ("s" if hi.suit == lo.suit else "o")
-
-
-def soft_keep(position, cutoff): # 1 inside the cutoff, fading to 0 outside
-    return 1 / (1 + math.exp((position - cutoff) / EDGE))
 
 
 def preflop_percentiles(num_players): # Hand label -> share of combos at least as strong
@@ -128,13 +101,13 @@ class Range:
         dead = {key(c) for c in dead_cards}
         self.combos = [list(c) for c in combinations(Deck().cards, 2)
                        if key(c[0]) not in dead and key(c[1]) not in dead]
-        self.weights = [1.0] * len(self.combos)
+        self.weights = np.ones(len(self.combos))
         self.history = []
 
     def total(self):
         return sum(self.weights)
 
-    def preflop(self, action, num_players, t=NO_READ): # Narrow by their preflop action
+    def preflop(self, action, num_players, t=NO_READ): # Narrow by their preflop action (t: their Profile)
         kind = PREFLOP_ACTIONS.get(action.strip().lower())
         if kind is None:
             return
@@ -173,55 +146,32 @@ class Range:
             out.append(lo / len(ranks))
         return out
 
-    def river_bet(self, board, pot_before, bet, t=NO_READ): # Narrow by a river bet: value + bluffs
-        ratio = bet / pot_before
-        value_cut = min(0.92, 0.65 + 0.20 * ratio)  # bigger bets, stronger value
+    def street_arrays(self, board): # Strength and draw code of every combo on this board; dead combos get weight 0
         s = self.strengths(board)
-        value, air = [0.0] * len(s), [0.0] * len(s)
-        for i, x in enumerate(s):
-            if x is None:
-                self.weights[i] = 0.0
-                continue
-            value[i] = 1 - soft_keep(x, value_cut)
-            air[i] = soft_keep(x, t.air_cutoff)
-        value_mass = sum(w * v for w, v in zip(self.weights, value))
-        air_mass = sum(w * a for w, a in zip(self.weights, air))
+        dead = np.array([x is None for x in s])
+        self.weights[dead] = 0.0
+        strength = np.array([0.0 if x is None else x for x in s])
+        draws = np.array([DRAWS[draw_type(c, board)] if len(board) < 5 else 0 for c in self.combos])
+        return strength, draws
 
-        share = t.bluff_share if t.bluff_share is not None else bet / (pot_before + 2 * bet)  # balanced
-        bluff_w = 0.0 if air_mass == 0 else min(1.0, share / (1 - share) * value_mass / air_mass)
-        for i in range(len(self.weights)):
-            middle = max(0.0, 1 - value[i] - air[i])
-            self.weights[i] *= value[i] + bluff_w * air[i] + t.medium_bet * middle
-        self.bluff_weight = bluff_w
+    def river_bet(self, board, pot_before, bet, t=NO_READ): # Narrow by a river bet: value + bluffs
+        strength, draws = self.street_arrays(board)
+        self.weights *= bet_weights(strength, draws, bet / pot_before, "river", t, base=self.weights)
         self.history.append(f"bet {bet:g} into {pot_before:g} on the river")
 
     def street_action(self, board, action, size=None, t=NO_READ): # Narrow by a flop/turn action
-        size = size or 0.5
-        s = self.strengths(board)
-        flop = len(board) == 3
-        for i, x in enumerate(s):
-            if x is None:
-                self.weights[i] = 0.0
-                continue
-            draw = draw_type(self.combos[i], board)
-            value_cut = min(0.90, (0.60 if action != "raise" else 0.75) + 0.15 * size)
-            value = 1 - soft_keep(x, value_cut)
-            air = soft_keep(x, t.air_cutoff) * (0 if draw else 1)
-            middle = max(0.0, 1 - value - air) * (0 if draw else 1)
-            drawing = {"Flush draw": t.semi_bluff, "Straight draw": t.semi_bluff,
-                       "Gutshot": t.gutshot_bet}.get(draw, 0)
-            if action == "bet":
-                bluff = t.flop_bluff if flop else t.turn_bluff
-                w = value + air * bluff + middle * t.early_medium_bet + (1 - value) * drawing
-            elif action == "raise":
-                w = value + air * 0.1 + middle * 0.05 + (1 - value) * drawing * 0.6
-            elif action == "call":
-                w = value * 0.6 + middle + air * t.float_call + (1 - value) * (1.0 if draw else 0)
-            else:  # check
-                w = value * t.trap + middle + air * 0.8 + (1 - value) * (1 - drawing if draw else 0)
-            self.weights[i] *= w
-        street = "flop" if flop else "turn"
-        label = action if action != "bet" else f"bet {size:.0%} pot"
+        strength, draws = self.street_arrays(board)
+        street = "flop" if len(board) == 3 else "turn"
+        if action == "bet":
+            w = bet_weights(strength, draws, size or 0.5, street, t)
+        elif action == "raise":  # a raise is a big bet: stronger value, fewer bluffs
+            w = bet_weights(strength, draws, 2.0, street, t)
+        elif action == "call":
+            w = call_weights(strength, draws, t.bet_size, street, t, base=self.weights)
+        else:  # check: everything they'd have bet, the other way round
+            w = 1 - bet_weights(strength, draws, t.bet_size, street, t)
+        self.weights *= w
+        label = action if action != "bet" else f"bet {size or 0.5:.0%} pot"
         self.history.append(f"{label} on the {street}")
 
     def river_equity(self, hole, board): # Exact equity vs this range, heads-up
@@ -286,7 +236,7 @@ class RangeModel: # Opponent model: the first opponent comes from the range, any
                        if w > 0 and key(c[0]) in live and key(c[1]) in live]
             self._hands, self._weights = [c for c, _ in options], [w for _, w in options]
             self._deck_id = id(deck)
-        first = random.choices(self._hands, weights=self._weights)[0]
+        first = random.choices(self._hands, weights=self._weights)[0]  # weights may be numpy floats
         if num_opponents == 1:
             return [first], first
         rest = [c for c in deck if key(c) not in {key(first[0]), key(first[1])}]
