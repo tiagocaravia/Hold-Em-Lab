@@ -21,8 +21,18 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "
 FEATURES = ["street", "hand strength", "our draw", "equity vs their range", "to call (pots)", "aggressive",
             "size (pots)", "guided value", "fold chance (guided)", "equity when called (guided)",
             "call rate at this size (read)", "times we bet this size", "pot (bb)", "stack behind (pots)",
-            "bluff share (read)", "their call rate (read)", "hands of evidence"]
+            "bluff share (read)", "their call rate (read)", "hands of evidence",
+            "their bluff share at this size (read)", "their bets seen at this size"]
 GUIDED = FEATURES.index("guided value")  # the model learns a correction to this
+
+
+def predict(model, rows): # Model corrections; older models trained on fewer inputs get just the ones they know
+    rows = np.asarray(rows, dtype=float)
+    return model.predict(rows[:, :model.n_features_in_])
+
+
+def size_group(ratio): # Their bet as a fraction of the pot -> 0 small (< 0.6), 1 medium, 2 big (over pot)
+    return 0 if ratio < 0.6 else 1 if ratio <= 1.0 else 2
 
 # CONFLICT[i] marks every hand that shares a card with hand i
 _onehot = np.zeros((len(COMBOS), 52), dtype=np.float32)
@@ -95,6 +105,7 @@ class Agent: # The hand-built bot: ranging + pot odds + reads. The ML bot's guid
         self.truth = profile if self.oracle else None
         self.bets_seen = self.bluffs_seen = 0
         self.calls = self.folds = 0
+        self.size_seen, self.size_bluffs = [0, 0, 0], [0, 0, 0]  # their bets seen at showdown, by size group
 
     def new_hand(self, pool, board, mine):
         self.range = (~CONFLICT[mine]).astype(float)  # any two cards they could hold
@@ -103,10 +114,14 @@ class Agent: # The hand-built bot: ranging + pot odds + reads. The ML bot's guid
         return self.truth or NO_READ
 
     # --- reads ---
-    def bluff_share(self, prior): # Share of their bets we think are bluffs (None = use the profile as is)
+    def bluff_share(self, prior, size=None): # Share of their bets (of this size) we think are bluffs; None = profile as is
         if self.truth or not self.learns:
             return None
-        return (self.bluffs_seen + self.k * prior) / (self.bets_seen + self.k)
+        overall = (self.bluffs_seen + self.k * prior) / (self.bets_seen + self.k)
+        if size is None:
+            return overall
+        g = size_group(size)  # this size's own record, starting from the overall read
+        return (self.size_bluffs[g] + self.k * overall) / (self.size_seen[g] + self.k)
 
     def call_rate(self, size): # Share of their range we think continues against our bet
         prior = 1 / (1 + size)  # no read: they defend just enough
@@ -122,7 +137,7 @@ class Agent: # The hand-built bot: ranging + pot odds + reads. The ML bot's guid
         s, d, p = spot.strengths(), spot.draws(), self.belief()
         weights = bet_weights(s, d, size, spot.street, p, base=self.range * spot.live())
         prior = (self.range * weights * (s < AIR) * (d == 0)).sum() / max((self.range * weights).sum(), 1e-12)
-        share = self.bluff_share(prior)
+        share = self.bluff_share(prior, size)
         if share is not None:
             weights = bet_weights(s, d, size, spot.street, p, base=self.range * spot.live(), share=share)
         return weights
@@ -215,10 +230,13 @@ class Agent: # The hand-built bot: ranging + pot odds + reads. The ML bot's guid
         else:
             self.folds += 1
 
-    def showdown(self, their_bets): # We saw their hand: count which of their bets were bluffs
-        for strength, draw in their_bets:
+    def showdown(self, their_bets): # We saw their hand: which of their bets (strength, draw, size) were bluffs
+        for strength, draw, size in their_bets:
+            bluff = strength < AIR and draw == 0
             self.bets_seen += 1
-            self.bluffs_seen += strength < AIR and draw == 0
+            self.bluffs_seen += bluff
+            self.size_seen[size_group(size)] += 1
+            self.size_bluffs[size_group(size)] += bluff
 
     def finish_hand(self, net):
         pass
@@ -258,9 +276,12 @@ class MLAgent(Agent): # Hand-built value of each option + a learned correction, 
             rate = (calls + self.k * self.call_rate(parts["ratio"])) / (calls + folds + self.k)
             guided, fold, equity_called, seen = parts["value"], parts["fold"], parts["equity_called"], calls + folds
         read = self.bluff_share(1 / 3)
+        facing = to_call / max(pot - to_call, 1e-9) if to_call else None  # the bet we face, as a fraction of the pot
+        size_read = self.bluff_share(1 / 3, facing) if facing else None
+        size_seen = self.size_seen[size_group(facing)] if facing and self.learns else 0
         return [street, strength, draw, equity, to_call / pot, float(parts is not None), size, guided, fold,
                 equity_called, rate, seen, pot, spot.behind / pot, 1 / 3 if read is None else read,
-                self.call_rate(0.75), self.evidence()]
+                self.call_rate(0.75), self.evidence(), (1 / 3 if size_read is None else size_read), size_seen]
 
     def decide(self, spot, to_call, can_raise, situation, rng):
         basics = (STREETS.index(spot.street), float(spot.strengths()[spot.mine]), int(spot.draws()[spot.mine]),
@@ -271,7 +292,7 @@ class MLAgent(Agent): # Hand-built value of each option + a learned correction, 
             self.spot_log.append((to_call > 0, spot.street, rows))
         values = np.array([r[GUIDED] for r in rows])
         if self.model is not None:
-            values = values + self.model.predict(rows)
+            values = values + predict(self.model, rows)
         if self.rng.random() < self.explore:  # try something random now and then (folding included)
             pick = int(self.rng.integers(len(opts) + (to_call > 0))) - (to_call > 0)
         else:

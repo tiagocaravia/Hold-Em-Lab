@@ -103,7 +103,7 @@ class Bot: # The plug-in bot: one act() call per decision
                     situation = ("vs_limp" if to_call == 0 else "open") if aggressions == 0 else SITUATIONS[aggressions - 1]
                     agent.see(self.spot(street, pot), move, chips / pot, to_call / max(pot - to_call, 1e-9), situation)
                     if street != "preflop" and move in ("bet", "raise"):
-                        h["their_bets"].append(street)
+                        h["their_bets"].append((street, chips / pot))
             h["put"][who] += chips
             h["cur"][who] += chips
             h["aggressions"] += move in ("bet", "raise")
@@ -132,9 +132,9 @@ class Bot: # The plug-in bot: one act() call per decision
         elif their_hole:  # showdown: which of their bets were bluffs?
             theirs = combo_of(card_ids(their_hole))
             bets = []
-            for street in self.hand["their_bets"]:
+            for street, size in self.hand["their_bets"]:
                 spot = self.spot(street, 1.0)
-                bets.append((float(spot.strengths()[theirs]), int(spot.draws()[theirs])))
+                bets.append((float(spot.strengths()[theirs]), int(spot.draws()[theirs]), size))
             agent.showdown(bets)
         self.hand = None
 

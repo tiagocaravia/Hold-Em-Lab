@@ -114,7 +114,7 @@ def play_hand(a, b, pool, world, own, a_is_small_blind): # One hand between two 
             if street != "preflop" and move in ("bet", "raise"):
                 idx = {"flop": board[:1], "turn": board[:2], "river": board}[street]
                 shown[p].append((float(np.nan_to_num(pool.strength[street][idx][cards[p]])),
-                                 int(pool.draws[street][idx][cards[p]]) if street != "river" else 0))
+                                 int(pool.draws[street][idx][cards[p]]) if street != "river" else 0, added / pot))
             put[p] += added
             cur[p] += added
             behind[p] -= added

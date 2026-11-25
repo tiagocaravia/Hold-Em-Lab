@@ -9,7 +9,7 @@ import numpy as np
 from sklearn.inspection import permutation_importance
 
 from bots.arena import play
-from bots.ml_agent import FEATURES, GUIDED, MODEL_PATH, MLAgent
+from bots.ml_agent import FEATURES, GUIDED, MODEL_PATH, MLAgent, predict
 from bots.pool import load
 from poker.profiles import TEST_PRESETS
 
@@ -28,6 +28,7 @@ def collect(model, hands, seed): # Real spots the trained bot faces, with a litt
 
 
 def reliance(model, X, names=FEATURES): # How much the model's own predictions change when each input is shuffled
+    X = np.asarray(X, dtype=float)[:, :model.n_features_in_]
     target = model.predict(X)
     result = permutation_importance(model, X, target, scoring="r2", n_repeats=5, random_state=0)
     order = np.argsort(result.importances_mean)
@@ -90,7 +91,7 @@ def collect_spots(pool, seed, hands=6000): # A fixed set of decisions to replay 
 
 def choices(model, decisions, can_fold): # What the bot picks in each decision: index into its options (-1 = fold)
     flat = np.array([r for rows in decisions for r in rows])
-    values = flat[:, GUIDED] + (model.predict(flat) if model is not None else 0)
+    values = flat[:, GUIDED] + (predict(model, flat) if model is not None else 0)
     picks, i = [], 0
     for rows in decisions:
         v = values[i:i + len(rows)]
