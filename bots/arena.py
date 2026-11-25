@@ -1,4 +1,5 @@
 import argparse
+from dataclasses import replace
 import math
 import os
 import random
@@ -48,71 +49,114 @@ def their_move(profile, pool, board, theirs, street, pot, to_call, can_raise, ag
     return "fold", 0.0
 
 
-def play_hand(agent, profile, pool, world, own, we_are_small_blind): # One hand, preflop to river. Returns our net bb
-    board, mine, theirs = pool.deal(world)
-    dice = iter(world.random(40))  # the opponent's random choices, drawn up front so every bot faces the same ones
-    agent.new_hand(pool, board, mine)
-    us_first = we_are_small_blind
-    put = {"us": BLINDS[0] if us_first else BLINDS[1], "them": BLINDS[1] if us_first else BLINDS[0]}
-    behind = {p: STACK - put[p] for p in put}
-    shown = []  # their bets and raises after the flop, as (strength, draw), learned from at showdown
+class ProfilePlayer: # A rule-based opponent: plays its Profile with the shared rules
+    def __init__(self, profile):
+        self.profile, self.name = profile, profile.name
+
+    def new_hand(self, pool, board, mine):
+        self.pool, self.board, self.mine = pool, board, mine
+
+    def decide(self, spot, to_call, can_raise, situation, rng):
+        move, added = their_move(self.profile, self.pool, self.board, self.mine, spot.street, spot.pot, to_call,
+                                 can_raise, spot.aggressions, self.dice)
+        return move, min(added, spot.behind)
+
+    def new_opponent(self, other):
+        pass
+
+    def see(self, *args):
+        pass
+
+    def saw_response(self, called):
+        pass
+
+    def showdown(self, their_bets):
+        pass
+
+    def finish_hand(self, net):
+        pass
+
+
+def play_hand(a, b, pool, world, own, a_is_small_blind): # One hand between two seats, preflop to river. Returns a's net bb
+    # Any player works in either seat: a bot, a ProfilePlayer, or a person (play.py)
+    board, combo_a, combo_b = pool.deal(world)
+    dice = iter(world.random(40))  # random choices for rule-based players, drawn up front so every bot faces the same ones
+    players, cards = {"a": a, "b": b}, {"a": combo_a, "b": combo_b}
+    for seat in players:
+        players[seat].dice = dice
+        players[seat].new_hand(pool, board, cards[seat])
+    small, big = ("a", "b") if a_is_small_blind else ("b", "a")
+    put = {small: BLINDS[0], big: BLINDS[1]}
+    behind = {seat: STACK - put[seat] for seat in put}
+    shown = {"a": [], "b": []}  # each seat's bets and raises after the flop, as (strength, draw): the other learns at showdown
     for street in STREETS:
-        order = ["us", "them"] if (street == "preflop") == us_first else ["them", "us"]
-        cur = dict(put) if street == "preflop" else {"us": 0.0, "them": 0.0}  # chips in on this street
-        aggressions, acted, i, we_just_bet = 0, set(), 0, False
-        while min(behind.values()) > 0 or cur["us"] != cur["them"]:
-            p, other = order[i % 2], order[(i + 1) % 2]
-            to_call = min(cur[other] - cur[p], behind[p])
+        order = [small, big] if street == "preflop" else [big, small]
+        cur = dict(put) if street == "preflop" else {"a": 0.0, "b": 0.0}  # chips in on this street
+        aggressions, acted, i, just_bet = 0, set(), 0, {"a": False, "b": False}
+        while min(behind.values()) > 0 or cur["a"] != cur["b"]:
+            p, o = order[i % 2], order[(i + 1) % 2]
+            to_call = min(cur[o] - cur[p], behind[p])
             pot = sum(put.values())
-            can_raise = aggressions < 2 and behind[other] > 0 and behind[p] > to_call
-            if p == "us":
-                spot = Spot(pool, board, street, mine, pot, put["us"], behind["us"])
-                situation = SITUATIONS[min(aggressions, 1)]
-                move, added = agent.decide(spot, to_call, can_raise, situation, own)
-            else:
-                move, added = their_move(profile, pool, board, theirs, street, pot, to_call, can_raise, aggressions, dice)
-                added = min(added, behind["them"])
-                spot = Spot(pool, board, street, mine, pot)
-                situation = ("vs_limp" if to_call == 0 else "open") if aggressions == 0 else SITUATIONS[aggressions - 1]
-                if street != "preflop" and move in ("bet", "raise"):
-                    idx = {"flop": board[:1], "turn": board[:2], "river": board}[street]
-                    shown.append((float(np.nan_to_num(pool.strength[street][idx][theirs])),
-                                  int(pool.draws[street][idx][theirs]) if street != "river" else 0))
-                if move != "fold":
-                    agent.see(spot, move, added / pot, to_call / max(pot - to_call, 1e-9), situation)
-            if p == "them" and we_just_bet:  # how they answered our bet or raise
-                agent.saw_response(move != "fold")
+            can_raise = aggressions < 2 and behind[o] > 0 and behind[p] > to_call
+            spot = Spot(pool, board, street, cards[p], pot, put[p], behind[p], aggressions)
+            move, added = players[p].decide(spot, to_call, can_raise, SITUATIONS[min(aggressions, 1)], own)
+            added = min(added, behind[p])
+            if just_bet[o]:  # how p answered o's bet or raise
+                players[o].saw_response(move != "fold")
             if move == "fold":
-                return -put["us"] if p == "us" else sum(put.values()) - put["us"]
+                if hasattr(players[o], "opponent_folded"):  # a person wants to be told
+                    players[o].opponent_folded()
+                net_p = -put[p]
+                return net_p if p == "a" else sum(put.values()) - put["a"]
+            faced = ("vs_limp" if to_call == 0 else "open") if aggressions == 0 else SITUATIONS[aggressions - 1]
+            players[o].see(Spot(pool, board, street, cards[o], pot), move, added / pot,
+                           to_call / max(pot - to_call, 1e-9), faced)
+            if street != "preflop" and move in ("bet", "raise"):
+                idx = {"flop": board[:1], "turn": board[:2], "river": board}[street]
+                shown[p].append((float(np.nan_to_num(pool.strength[street][idx][cards[p]])),
+                                 int(pool.draws[street][idx][cards[p]]) if street != "river" else 0))
             put[p] += added
             cur[p] += added
             behind[p] -= added
-            we_just_bet = p == "us" and move in ("bet", "raise")
+            just_bet = {p: move in ("bet", "raise"), o: False}
             aggressions += move in ("bet", "raise")
             acted.add(p)
             i += 1
-            if move in ("check", "call") and len(acted) == 2 and cur["us"] == cur["them"]:
+            if move in ("check", "call") and len(acted) == 2 and cur["a"] == cur["b"]:
                 break
             if move == "call" and min(behind.values()) == 0:
                 break
-        if min(behind.values()) == 0:
-            continue  # someone is all in: deal the rest, no more betting
-    diff = int(pool.rank[board][mine]) - int(pool.rank[board][theirs])
-    agent.showdown(shown)
+    diff = int(pool.rank[board][combo_a]) - int(pool.rank[board][combo_b])
+    a.showdown(shown["b"])
+    b.showdown(shown["a"])
+    for seat, other in (("a", "b"), ("b", "a")):
+        if hasattr(players[seat], "reveal"):  # players who want to see the other hand (a person, the interface)
+            players[seat].reveal(cards[other])
     total = sum(put.values())
-    return (total if diff > 0 else total / 2 if diff == 0 else 0) - put["us"]
+    return (total if diff > 0 else total / 2 if diff == 0 else 0) - put["a"]
 
 
-def play(agent, pool, hands, session_len, seed, presets=PRESETS): # One bot vs a new random opponent every session
+def play(agent, pool, hands, session_len, seed, presets=PRESETS, league=(), self_share=0.0):
+    # One bot vs a new opponent every session: a rule-based profile, or (self_share of sessions)
+    # a frozen ML bot drawn from league, a list of trained models: self-play
     world = np.random.default_rng(seed)    # deals and opponents' choices: identical for every bot
     own = np.random.default_rng(seed + 1)  # the bot's own mixing
     profile_rng = random.Random(seed)
+    league_rng = random.Random(seed + 7)   # separate dice, so profile sessions stay the same with or without self-play
     results = []                           # (hand number within session, opponent type, net bb)
     for i in range(hands):
         if i % session_len == 0:
             profile = random_profile(profile_rng, presets)
-            agent.new_opponent(profile)
-        net = play_hand(agent, profile, pool, world, own, we_are_small_blind=i % 2 == 0)
+            if league and league_rng.random() < self_share:
+                from bots.ml_agent import MLAgent
+                opponent = MLAgent("self-play", explore=0.0, models=league_rng.choice(league)).frozen("self-play")
+                opponent.new_opponent(None)  # it reads us too, as the hands go by
+                profile = replace(profile, name="self-play")
+                agent.new_opponent(None)
+            else:
+                opponent = ProfilePlayer(profile)
+                agent.new_opponent(profile)
+        net = play_hand(agent, opponent, pool, world, own, a_is_small_blind=i % 2 == 0)
         agent.finish_hand(net)
         results.append((i % session_len, profile.name, net))
     return results
@@ -123,24 +167,25 @@ _POOL = None  # each worker process loads the pool once
 
 def _play_block(job): # One worker: play a block of sessions, return results and anything the bot learned from
     global _POOL
-    make, hands, session_len, seed, presets = job
+    make, hands, session_len, seed, presets, league, self_share = job
     if _POOL is None:
         _POOL = load()
     agent = make()
     if hasattr(agent, "rng"):
         agent.rng = np.random.default_rng(seed)  # each worker explores with its own dice
-    results = play(agent, _POOL, hands, session_len, seed, presets)
+    results = play(agent, _POOL, hands, session_len, seed, presets, league, self_share)
     return results, getattr(agent, "data", [])
 
 
-def play_parallel(workers, make, hands, session_len, seed, presets=PRESETS): # play() split across every core
+def play_parallel(workers, make, hands, session_len, seed, presets=PRESETS, league=(), self_share=0.0): # play() on every core
     # returns (results, what the bot learned from)
-    # make: a function that builds a fresh bot (e.g. functools.partial(Agent, "learner")); same seed -> same hands
+    # make: a function that builds a fresh bot (e.g. functools.partial(Agent, "no read", learns=False)); same seed -> same hands
     sessions = max(1, hands // session_len)
     blocks = min(os.cpu_count(), sessions)
     sizes = [(sessions // blocks + (i < sessions % blocks)) * session_len for i in range(blocks)]  # sessions shared evenly
     sizes[-1] += hands - sum(sizes)
-    parts = workers.map(_play_block, [(make, n, session_len, seed * 1000 + i, presets) for i, n in enumerate(sizes)])
+    jobs = [(make, n, session_len, seed * 1000 + i, presets, league, self_share) for i, n in enumerate(sizes)]
+    parts = workers.map(_play_block, jobs)
     return [r for part in parts for r in part[0]], [x for part in parts for x in part[1]]
 
 

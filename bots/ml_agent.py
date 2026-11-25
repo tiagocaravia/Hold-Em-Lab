@@ -40,6 +40,7 @@ class Spot: # What the bot can see on one street
     pot: float     # everything in the middle, including any bet we face
     invested: float = 0.0  # what we've already put in this hand (sunk)
     behind: float = 0.0    # what we have left to bet
+    aggressions: int = 0   # bets and raises so far on this street
 
     def index(self):
         f, t, r = self.board
@@ -310,10 +311,9 @@ class MLAgent(Agent): # Hand-built value of each option + a learned correction, 
         return bot
 
 
-def lineup(): # The hand-built bot versions the arena compares
-    return [
-        Agent("no read", learns=False),
-        Agent("learner", learns=True),
-        Agent("learner + mixing", learns=True, mixes=True),
-        Agent("oracle", oracle=True),
-    ]
+def lineup(): # The bots the arena compares: the simple baseline, the peeking oracle, and the trained ML bot if saved
+    bots = [Agent("no read", learns=False), Agent("oracle", oracle=True)]
+    if os.path.exists(MODEL_PATH):
+        import joblib
+        bots.append(MLAgent("ML bot", explore=0.0, models=joblib.load(MODEL_PATH)).frozen("ML bot"))
+    return bots

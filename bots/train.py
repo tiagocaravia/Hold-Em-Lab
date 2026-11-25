@@ -18,6 +18,7 @@ from poker.profiles import PRESETS, TEST_PRESETS
 from poker.prompts import again, ask, interactive_loop, yes
 
 STATE_PATH = os.path.join(os.path.dirname(MODEL_PATH), "ml_state.joblib")  # models + training data + progress
+LEAGUE_SIZE = 5  # how many of its own recent versions it plays in self-play
 
 
 def edge(a, b): # Paired edge of a over b on the same hands, bb/100 with 95% CI
@@ -25,26 +26,29 @@ def edge(a, b): # Paired edge of a over b on the same hands, bb/100 with 95% CI
 
 
 def train(rounds, hands_per_round, test_hands, session_len, seed, show_plot=True, save=None, animate=None,
-          resume=False):
+          resume=False, self_share=0.5):
     test_seed = seed + 10_000  # different deals and opponents from training, the same every run
     state = joblib.load(STATE_PATH) if resume and os.path.exists(STATE_PATH) else None
     if resume and state is None:
         print("No saved bot to resume yet; starting fresh.")
     bot = MLAgent()
-    history, done = [], 0  # (training hands so far, ML result, edge over learner) per round
+    history, done = [], 0  # (training hands so far, ML result, edge over no read) per round
     if state:
         bot.model, bot.data = state["model"], state["data"]
         history, done = state["history"], state["rounds"]
+        league = state.get("league", [])
         print(f"Resuming: {done} rounds and {history[-1][0]:,} hands trained so far.")
     trained = history[-1][0] if history else 0
+    league = league if state else []  # recent trained versions of itself, for self-play
     print(f"\n=== Training: {rounds} more rounds × {hands_per_round:,} hands on {os.cpu_count()} cores, "
           f"tested on {test_hands:,} held-out hands each round ===")
 
     with Workers() as workers:
-        run = lambda make, hands, sd, presets=PRESETS: play_parallel(workers, make, hands, session_len, sd, presets)
+        run = lambda make, hands, sd, presets=PRESETS, opponents=(), share=0.0: play_parallel(
+            workers, make, hands, session_len, sd, presets, opponents, share)
         print("Testing the hand-built bots, for comparison...")
         baselines = {}
-        for name, kwargs in (("no read", dict(learns=False)), ("learner", {}), ("oracle", dict(oracle=True))):
+        for name, kwargs in (("no read", dict(learns=False)), ("oracle", dict(oracle=True))):
             baselines[name] = run(partial(Agent, name, **kwargs), test_hands, test_seed, TEST_PRESETS)[0]
             m, h = bb100([r[2] for r in baselines[name]])
             print(f"  {name:<10} {m:+7.1f} ± {h:.1f} bb/100")
@@ -52,26 +56,28 @@ def train(rounds, hands_per_round, test_hands, session_len, seed, show_plot=True
         frames = [{"label": "round 0, the hand-built guidance it starts from", "models": None} if not state else
                   {"label": f"resumed at {trained:,} hands", "models": state["model"], "trained": trained,
                    "test": history[-1][1], "edge": history[-1][2]}]  # for --animate
-        print(f"\n  {'round':<6} {'trained on':>11} {'explore':>8}   {'ML bb/100':>15}   {'edge over learner':>19}")
+        print(f"\n  {'round':<6} {'trained on':>11} {'explore':>8}   {'ML bb/100':>15}   {'edge over no read':>19}")
         for r in range(done, done + rounds):
             start = time.time()
             explore = max(0.05, 0.30 * 0.6 ** r)  # explore a lot early, less later
-            _, data = run(partial(MLAgent, explore=explore, models=bot.model), hands_per_round, seed + r)
+            _, data = run(partial(MLAgent, explore=explore, models=bot.model), hands_per_round, seed + r,
+                          PRESETS, league, self_share)
             bot.data += data
             bot.train()
+            league = (league + [bot.model])[-LEAGUE_SIZE:]
             test = run(partial(MLAgent, explore=0.0, models=bot.model), test_hands, test_seed, TEST_PRESETS)[0]
             m, h = bb100([x[2] for x in test])
-            e, eh = edge(test, baselines["learner"])
+            e, eh = edge(test, baselines["no read"])
             trained += hands_per_round
             history.append((trained, (m, h), (e, eh)))
             frames.append({"label": f"round {r + 1}, {trained:,} hands trained", "models": bot.model,
                            "trained": trained, "test": (m, h), "edge": (e, eh)})
-            save_state(bot, history, r + 1)
+            save_state(bot, history, r + 1, league)
             print(f"  {r + 1:<6} {trained:>11,} {explore:>8.2f}   {m:>+7.1f} ± {h:<5.1f}   "
                   f"{e:>+8.1f} ± {eh:<5.1f}   ({time.time() - start:.0f}s, saved)")
 
     print("\nFinal test, by opponent type (bb/100; 'tricky' was never seen in training)")
-    names = ["no read", "learner", "oracle"]
+    names = ["no read", "oracle"]
     print(f"  {'':<16}{'ML':>16}" + "".join(f"{n:>16}" for n in names))
     for kind in TEST_PRESETS:
         row = f"  {kind:<16}"
@@ -90,9 +96,10 @@ def train(rounds, hands_per_round, test_hands, session_len, seed, show_plot=True
         plot(history, baselines, save)
 
 
-def save_state(bot, history, rounds): # Everything needed to keep training later, saved after every round
+def save_state(bot, history, rounds, league): # Everything needed to keep training later, saved after every round
     os.makedirs(os.path.dirname(STATE_PATH), exist_ok=True)
-    joblib.dump({"model": bot.model, "data": bot.data, "history": history, "rounds": rounds}, STATE_PATH, compress=3)
+    joblib.dump({"model": bot.model, "data": bot.data, "history": history, "rounds": rounds, "league": league},
+                STATE_PATH, compress=3)
     joblib.dump(bot.model, MODEL_PATH)
 
 
@@ -105,7 +112,7 @@ def plot(history, baselines, save=None):
     m = [r[0] for _, r, _ in history]
     h = [r[1] for _, r, _ in history]
     ax1.errorbar(x, m, yerr=h, marker="o", capsize=3, color="black", label="ML bot (held-out test)")
-    for name, color in (("no read", "tab:blue"), ("learner", "tab:green"), ("oracle", "tab:purple")):
+    for name, color in (("no read", "tab:blue"), ("oracle", "tab:purple")):
         b, _ = bb100([r[2] for r in baselines[name]])
         ax1.axhline(b, color=color, linestyle="--", label=f"{name} ({b:+.1f})")
     ax1.set_xlabel("Training hands")
@@ -117,10 +124,10 @@ def plot(history, baselines, save=None):
     e = [r[0] for *_, r in history]
     eh = [r[1] for *_, r in history]
     ax2.errorbar(x, e, yerr=eh, marker="o", capsize=3, color="black")
-    ax2.axhline(0, color="tab:green", linestyle="--", label="hand-built learner")
+    ax2.axhline(0, color="tab:blue", linestyle="--", label="no read")
     ax2.set_xlabel("Training hands")
-    ax2.set_ylabel("Edge over hand-built learner (bb/100, 95% CI)")
-    ax2.set_title("Does it beat the guidance it started from?")
+    ax2.set_ylabel("Edge over 'no read' (bb/100, 95% CI)")
+    ax2.set_title("How far ahead of the simple hand-built bot")
     ax2.grid(True, linestyle="--", alpha=0.4)
     ax2.legend(fontsize=9)
 
@@ -165,9 +172,11 @@ def main():
     parser.add_argument("--no-plot", action="store_true", help="Skip the plot")
     parser.add_argument("--animate", default=None, metavar="FILE.gif", help="Also save an animation of training, one frame per round")
     parser.add_argument("--resume", action="store_true", help="Keep training the saved bot instead of starting fresh")
+    parser.add_argument("--self-play", type=float, default=0.5, metavar="SHARE",
+                        help="Share of training sessions played against its own recent versions (0 to 1; 0 = only profiles)")
     args = parser.parse_args()
     train(args.rounds, args.hands, args.test_hands, args.session, args.seed, not args.no_plot, args.save, args.animate,
-          args.resume)
+          args.resume, args.self_play)
 
 
 if __name__ == "__main__":

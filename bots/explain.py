@@ -55,6 +55,8 @@ def explain(hands=20000, seed=99, save=None):
     if ignored:
         ax.text(0.98, 0.03, "ignores: " + ", ".join(ignored), transform=ax.transAxes, ha="right", fontsize=8, color="#666666")
     print("  most relied on: " + ", ".join(f"{l} ({m:.2f})" for l, m in zip(labels[::-1][:5], mean[::-1][:5])))
+    print()
+    print_tell(sizing_tell(model, collect_spots(load(), seed + 1)), "Does its bet size give its hand away?")
     fig.tight_layout()
     if save:
         fig.savefig(save, dpi=120)
@@ -114,6 +116,27 @@ def policy(model, spots): # Share of each action by hand strength, for the three
     return out
 
 
+def sizing_tell(model, spots): # Does the bet size give the hand away? Strength and bluff share at each size
+    decisions = spots["free"]
+    picks = choices(model, decisions, can_fold=False)
+    strength = np.array([rows[0][1] for rows in decisions])
+    draw = np.array([rows[0][2] for rows in decisions])
+    out = {}
+    for a, label in enumerate(FREE):
+        chosen = picks == a
+        if chosen.any():
+            out[label] = {"share": chosen.mean(), "strength": strength[chosen].mean(),
+                          "bluffs": ((strength < 0.5) & (draw == 0))[chosen].mean()}
+    return out
+
+
+def print_tell(tell, title):
+    print(f"  {title}")
+    print(f"    {'when checked to':<16}{'how often':>10}{'avg strength':>14}{'bluffs':>9}")
+    for label, t in tell.items():
+        print(f"    {label:<16}{t['share']:>10.0%}{t['strength']:>14.2f}{t['bluffs']:>9.0%}")
+
+
 def animate_training(frames, spots, baselines, path): # One frame per round: results, decisions, what it relies on
     import matplotlib.pyplot as plt
     from matplotlib.animation import FuncAnimation
@@ -150,7 +173,7 @@ def animate_training(frames, spots, baselines, path): # One frame per round: res
         fig.suptitle(f"Training the ML bot: {f['label']}", fontsize=14, fontweight="bold")
         done = frames[1:i + 1]
 
-        for name, color in (("no read", "tab:blue"), ("learner", "tab:green"), ("oracle", "tab:purple")):
+        for name, color in (("no read", "tab:blue"), ("oracle", "tab:purple")):
             ax_win.axhline(baselines[name], color=color, linestyle="--", linewidth=2, label=name)
         if done:
             ax_win.errorbar([d["trained"] for d in done], [d["test"][0] for d in done],
@@ -160,12 +183,12 @@ def animate_training(frames, spots, baselines, path): # One frame per round: res
         ax_win.legend(fontsize=8, loc="lower right")
         ax_win.grid(True, linestyle="--", alpha=0.4)
 
-        ax_edge.axhline(0, color="tab:green", linestyle="--", linewidth=2)
+        ax_edge.axhline(0, color="tab:blue", linestyle="--", linewidth=2)
         if done:
             ax_edge.errorbar([d["trained"] for d in done], [d["edge"][0] for d in done],
                              yerr=[d["edge"][1] for d in done], color="black", marker="o", capsize=3)
         ax_edge.set(xlim=(0, max(trained) * 1.05), ylim=(elo, ehi), xlabel="Training hands", ylabel="bb/100 (95% CI)",
-                    title="Edge over the hand-built learner it started from")
+                    title="Edge over 'no read' (the simple hand-built bot)")
         ax_edge.grid(True, linestyle="--", alpha=0.4)
 
         p = f["policy"]
