@@ -10,9 +10,9 @@ import joblib
 from functools import partial
 from multiprocessing import Pool as Workers
 
-from bots.arena import bb100, play_parallel
+from bots.arena import bb100, parse_players, play_parallel
 from bots.explain import animate_training, collect_spots
-from bots.ml_agent import MODEL_PATH, Agent, MLAgent
+from bots.ml_agent import FEATURES, MODEL_PATH, Agent, MLAgent
 from bots.pool import load
 from poker.profiles import PRESETS, TEST_PRESETS
 from poker.prompts import again, ask, interactive_loop, yes
@@ -26,11 +26,15 @@ def edge(a, b): # Paired edge of a over b on the same hands, bb/100 with 95% CI
 
 
 def train(rounds, hands_per_round, test_hands, session_len, seed, show_plot=True, save=None, animate=None,
-          resume=False, self_share=0.5):
+          resume=False, self_share=0.5, players=2):
+    # players: table size, or (fewest, most): every session gets a random size in that range
     test_seed = seed + 10_000  # different deals and opponents from training, the same every run
     state = joblib.load(STATE_PATH) if resume and os.path.exists(STATE_PATH) else None
     if resume and state is None:
         print("No saved bot to resume yet; starting fresh.")
+    if state and len(state["data"][0][0]) != len(FEATURES):
+        print("The saved bot was trained on a different set of inputs; starting fresh.")
+        state = None
     bot = MLAgent()
     history, done = [], 0  # (training hands so far, ML result, edge over no read) per round
     if state:
@@ -40,12 +44,13 @@ def train(rounds, hands_per_round, test_hands, session_len, seed, show_plot=True
         print(f"Resuming: {done} rounds and {history[-1][0]:,} hands trained so far.")
     trained = history[-1][0] if history else 0
     league = league if state else []  # recent trained versions of itself, for self-play
-    print(f"\n=== Training: {rounds} more rounds × {hands_per_round:,} hands on {os.cpu_count()} cores, "
+    size = f"{players}" if isinstance(players, int) else f"{players[0]}-{players[1]}"
+    print(f"\n=== Training: {rounds} more rounds × {hands_per_round:,} hands at {size}-player tables on {os.cpu_count()} cores, "
           f"tested on {test_hands:,} held-out hands each round ===")
 
     with Workers() as workers:
         run = lambda make, hands, sd, presets=PRESETS, opponents=(), share=0.0: play_parallel(
-            workers, make, hands, session_len, sd, presets, opponents, share)
+            workers, make, hands, session_len, sd, presets, opponents, share, players)
         print("Testing the hand-built bots, for comparison...")
         baselines = {}
         for name, kwargs in (("no read", dict(learns=False)), ("oracle", dict(oracle=True))):
@@ -76,10 +81,11 @@ def train(rounds, hands_per_round, test_hands, session_len, seed, show_plot=True
             print(f"  {r + 1:<6} {trained:>11,} {explore:>8.2f}   {m:>+7.1f} ± {h:<5.1f}   "
                   f"{e:>+8.1f} ± {eh:<5.1f}   ({time.time() - start:.0f}s, saved)")
 
-    print("\nFinal test, by opponent type (bb/100; 'tricky' was never seen in training)")
+    print("\nFinal test, by heads-up opponent and by table size (bb/100; 'tricky' was never seen in training)")
     names = ["no read", "oracle"]
     print(f"  {'':<16}{'ML':>16}" + "".join(f"{n:>16}" for n in names))
-    for kind in TEST_PRESETS:
+    kinds = [k for k in TEST_PRESETS if any(x[1] == k for x in test)]
+    for kind in kinds + sorted({x[1] for x in test} - set(kinds)):
         row = f"  {kind:<16}"
         for results in [test] + [baselines[n] for n in names]:
             m, h = bb100([x[2] for x in results if x[1] == kind])
@@ -139,10 +145,19 @@ def plot(history, baselines, save=None):
         plt.show()
 
 
+def _players_error(text):
+    try:
+        parse_players(text)
+    except ValueError:
+        return "Between 2 and 9, e.g. 6 or 2-6."
+
+
 def interactive():
     print("=== Train the ML bot ===  (enter keeps the value in brackets)\n")
-    rounds, hands, test_hands, session_len, seed, show, movie = 5, 20000, 20000, 1000, 1, True, "none"
+    rounds, hands, test_hands, session_len, seed, show, movie, players = 5, 20000, 20000, 1000, 1, True, "none", "2"
     while True:
+        players = ask("Players per table, the bot included (2-9, or a range like 2-6)", players, str,
+                      lambda t: _players_error(t))
         rounds = ask("Training rounds", rounds, int, lambda n: None if n >= 1 else "At least 1.")
         hands = ask("Hands per round", hands, int, lambda n: None if n >= 1000 else "At least 1,000.")
         test_hands = ask("Test hands per round", test_hands, int, lambda n: None if n >= 1000 else "At least 1,000.")
@@ -153,7 +168,7 @@ def interactive():
         movie = ask("Save a training animation? (file name like training.gif, or none)", movie)
         resume = os.path.exists(STATE_PATH) and yes("Keep training the saved bot? (y/n)", True)
         train(rounds, hands, test_hands, session_len, seed, show, animate=None if movie == "none" else movie,
-              resume=resume)
+              resume=resume, players=parse_players(players))
         if not again():
             break
 
@@ -173,10 +188,16 @@ def main():
     parser.add_argument("--animate", default=None, metavar="FILE.gif", help="Also save an animation of training, one frame per round")
     parser.add_argument("--resume", action="store_true", help="Keep training the saved bot instead of starting fresh")
     parser.add_argument("--self-play", type=float, default=0.5, metavar="SHARE",
-                        help="Share of training sessions played against its own recent versions (0 to 1; 0 = only profiles)")
+                        help="Share of opponents that are its own recent versions (0 to 1; 0 = only profiles)")
+    parser.add_argument("--players", default="2", metavar="N or LO-HI",
+                        help="Players per table, the bot included: 6, or 2-6 for a random size each session (2-9)")
     args = parser.parse_args()
+    try:
+        players = parse_players(args.players)
+    except ValueError as e:
+        sys.exit(f"--{e}")
     train(args.rounds, args.hands, args.test_hands, args.session, args.seed, not args.no_plot, args.save, args.animate,
-          args.resume, args.self_play)
+          args.resume, args.self_play, players)
 
 
 if __name__ == "__main__":

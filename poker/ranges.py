@@ -4,7 +4,7 @@ from collections import Counter
 from itertools import combinations
 
 from .deck import Deck
-from .equity import RandomOpponents, key, pot_share
+from .equity import RangeOpponents, key, pot_share
 from .evaluator import category, hand_value
 from .profiles import DRAWS, NO_READ, bet_weights, call_weights, soft_keep
 from .tables import hand_label, load_table
@@ -223,22 +223,7 @@ class Range:
         return [(k, v / total) for k, v in sorted(types.items(), key=lambda kv: -kv[1])[:n]]
 
 
-class RangeModel: # Opponent model: the first opponent comes from the range, any others from `others`
+class RangeModel(RangeOpponents): # The first opponent from a narrowed Range; any others from `others` (an opponent model)
     def __init__(self, rng, others=None, name="ranged"):
-        self.rng = rng
-        self.others = others or RandomOpponents()
-        self.name = name
-
-    def deal(self, deck, num_opponents):
-        if getattr(self, "_deck_id", None) != id(deck):  # same deck every trial: filter once
-            live = {key(c) for c in deck}
-            options = [(c, w) for c, w in zip(self.rng.combos, self.rng.weights)
-                       if w > 0 and key(c[0]) in live and key(c[1]) in live]
-            self._hands, self._weights = [c for c, _ in options], [w for _, w in options]
-            self._deck_id = id(deck)
-        first = random.choices(self._hands, weights=self._weights)[0]  # weights may be numpy floats
-        if num_opponents == 1:
-            return [first], first
-        rest = [c for c in deck if key(c) not in {key(first[0]), key(first[1])}]
-        hands, dealt = self.others.deal(rest, num_opponents - 1)
-        return [first] + hands, list(first) + dealt
+        rest = others.seats[-1] if isinstance(others, RangeOpponents) else None  # None: any two cards
+        super().__init__(None, name, seats=[(rng.combos, rng.weights), rest])

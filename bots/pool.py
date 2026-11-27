@@ -15,6 +15,8 @@ from poker.tables import hand_label
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache", "hands.npz")
 CARDS = Deck().cards
 COMBOS = np.array(list(combinations(range(52), 2)))  # all 1,326 two-card hands, as card ids
+COMBO_ID = np.zeros((52, 52), dtype=int)  # two card ids -> their hand's index, either order
+COMBO_ID[COMBOS[:, 0], COMBOS[:, 1]] = COMBO_ID[COMBOS[:, 1], COMBOS[:, 0]] = np.arange(len(COMBOS))
 LIB_ID = [card_id(c) for c in CARDS]  # our card ids -> the fast evaluator's card numbers
 CONFLICT_PAIRS = np.array([[bool(set(a) & set(b)) for b in COMBOS] for a in COMBOS])  # hands that share a card
 RANK = np.array([c.rank_value for c in CARDS])  # 0 = deuce ... 12 = ace
@@ -62,14 +64,19 @@ class Pool:
         self.preflop_vs = data["preflop_vs"]        # (1326, 1326) row hand's equity against column hand, all-in preflop
         self.strength["preflop"] = data["preflop_strength"]  # each hand's equity vs a random hand
         self.preflop_pct = data["preflop_pct"]      # share of hands at least as strong (0 = aces)
+        self.preflop_ranks = data["preflop_ranks"]  # (boards, 1326) showdown order on independent random boards
 
-    def deal(self, rng): # A full board plus two disjoint random hands
+    def deal(self, rng, players=2): # A full board plus disjoint random hands: (f, t, r), [hand of each player]
         f, t, r = rng.integers(FLOPS), rng.integers(TURNS), rng.integers(RIVERS)
-        live = np.flatnonzero(self.rank[f, t, r] >= 0)
-        while True:
-            a, b = rng.choice(live, size=2, replace=False)
-            if not set(COMBOS[a]) & set(COMBOS[b]):
-                return (f, t, r), a, b
+        if players == 2:  # the original two-hand deal, so heads-up results stay comparable
+            live = np.flatnonzero(self.rank[f, t, r] >= 0)
+            while True:
+                a, b = rng.choice(live, size=2, replace=False)
+                if not set(COMBOS[a]) & set(COMBOS[b]):
+                    return (f, t, r), [a, b]
+        board = [*self.flops[f], self.turns[f, t], self.rivers[f, t, r]]
+        cards = rng.choice(np.setdiff1d(np.arange(52), board), size=2 * players, replace=False)
+        return (f, t, r), list(COMBO_ID[cards[0::2], cards[1::2]])
 
 
 def score_flop(seed): # Everything for one random flop: its turns and rivers, every hand's rank, and draws
@@ -141,7 +148,7 @@ def build(seed=1):
                                       chunksize=50))
     vs, preflop_strength, pct = preflop_tables(boards)
     print(f"  preflop equity of every hand vs every hand in {time.time() - start:.0f}s")
-    return dict(flops=flops, turns=turns, rivers=rivers, rank=rank, river_strength=strength.astype(np.float16),
+    return dict(preflop_ranks=boards.astype(np.int16), flops=flops, turns=turns, rivers=rivers, rank=rank, river_strength=strength.astype(np.float16),
                 turn_equity=turn_equity, flop_equity=flop_equity, flop_draw=flop_draw, turn_draw=turn_draw,
                 played=played_weights(), preflop_vs=vs, preflop_strength=preflop_strength, preflop_pct=pct)
 
@@ -169,4 +176,10 @@ def load():
         os.makedirs(os.path.dirname(CACHE), exist_ok=True)
         np.savez_compressed(CACHE, **data)
         return Pool(data)
-    return Pool(dict(np.load(CACHE)))
+    data = dict(np.load(CACHE))
+    if "preflop_ranks" not in data:  # caches built before multiway play: add the preflop boards (same seeds)
+        with Workers() as workers:
+            data["preflop_ranks"] = np.array(workers.map(rank_random_board, range(10_000_000, 10_000_000 + PREFLOP_BOARDS),
+                                                         chunksize=50)).astype(np.int16)
+        np.savez_compressed(CACHE, **data)
+    return Pool(data)

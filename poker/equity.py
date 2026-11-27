@@ -36,22 +36,36 @@ class FoldingOpponents: # Any two cards, weak hands fold; their cards stay dead
         return [h for h in hands if hand_label(*h) in self.keep], cards
 
 
-class RangeOpponents: # Hands drawn from a list, e.g. the hands people play
-    def __init__(self, pool, name="range"):
-        self.pool = pool
+class RangeOpponents: # Hands drawn from ranges: one for every seat, or one per seat; weights make some hands likelier
+    def __init__(self, pool, name="range", weights=None, seats=None):
+        # pool, weights: every seat's hands and how likely each is (None: all equally likely)
+        # seats: [(pool, weights) or None, ...] one per seat instead (None: any two cards); the last covers any extra seats
+        self.seats = seats or [(pool, weights)]
         self.name = name
+        self._deck_id = None
 
     def deal(self, deck, num_opponents):
-        live = {key(c) for c in deck}
-        available = [h for h in self.pool if key(h[0]) in live and key(h[1]) in live]
-        hands = []
-        for _ in range(num_opponents):
-            if not available:
-                raise ValueError("Opponent range has no hands left after removing known cards.")
-            hand = random.choice(available)
+        if self._deck_id != id(deck):  # usually the same deck every trial: filter each range against it once
+            live = {key(c) for c in deck}
+            self._options = [None if seat is None else
+                             [(h, 1.0 if seat[1] is None else seat[1][i]) for i, h in enumerate(seat[0])
+                              if key(h[0]) in live and key(h[1]) in live and (seat[1] is None or seat[1][i] > 0)]
+                             for seat in self.seats]
+            self._deck_id = id(deck)
+        hands, taken = [], set()
+        for i in range(num_opponents):
+            options = self._options[min(i, len(self._options) - 1)]
+            if options is None:  # any two cards left
+                hand = random.sample([c for c in deck if key(c) not in taken], 2)
+            else:
+                available = [(h, w) for h, w in options if key(h[0]) not in taken and key(h[1]) not in taken]
+                if not available:
+                    raise ValueError("Opponent range has no hands left after removing known cards.")
+                weighted = self.seats[min(i, len(self.seats) - 1)][1] is not None
+                hand = (random.choices([h for h, _ in available], weights=[w for _, w in available])[0] if weighted
+                        else random.choice(available)[0])
             hands.append(hand)
-            taken = {key(hand[0]), key(hand[1])}
-            available = [h for h in available if key(h[0]) not in taken and key(h[1]) not in taken]
+            taken |= {key(hand[0]), key(hand[1])}
         return hands, [c for h in hands for c in h]
 
 
