@@ -1,15 +1,15 @@
+import os
 import random
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so "poker" imports work
 
 import pytest
 
-from poker.card import parse_card
-from poker.deck import Deck
 from poker import evaluator
+from poker.deck import Deck
 from poker.evaluator import best_hand, category, get_hand_rank, hand_value
-
-
-def cards(s):
-    return [parse_card(c) for c in s.split()]
+from poker.prompts import cards_from as cards
 
 
 @pytest.mark.parametrize("hand, expected", [
@@ -52,3 +52,7 @@ def test_fast_evaluator_agrees_with_reference():
         assert category(fast_a) == ref_a[0]
         assert (fast_a > fast_b) == (ref_a > ref_b)
         assert (fast_a == fast_b) == (ref_a == ref_b)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q"]))

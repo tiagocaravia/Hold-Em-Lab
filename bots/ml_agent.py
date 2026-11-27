@@ -440,9 +440,15 @@ class MLAgent(Agent): # Hand-built value of each option + a learned correction, 
         return bot
 
 
+def frozen_ml(models, name="ML bot"): # A trained ML bot that only plays; a plain function so worker processes can build it
+    return MLAgent(name, explore=0.0, models=models).frozen(name)
+
+
 def lineup(): # The bots the arena compares: the simple baseline, the peeking oracle, and the trained ML bot if saved
-    bots = [Agent("no read", learns=False), Agent("oracle", oracle=True)]
+    # as (name, a function that builds a fresh one), so each worker process can make its own
+    from functools import partial
+    bots = [("no read", partial(Agent, "no read", learns=False)), ("oracle", partial(Agent, "oracle", oracle=True))]
     if os.path.exists(MODEL_PATH):
         import joblib
-        bots.append(MLAgent("ML bot", explore=0.0, models=joblib.load(MODEL_PATH)).frozen("ML bot"))
+        bots.append(("ML bot", partial(frozen_ml, joblib.load(MODEL_PATH))))
     return bots

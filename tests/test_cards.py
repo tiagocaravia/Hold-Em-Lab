@@ -1,3 +1,10 @@
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so "poker" imports work
+
+import pytest
+
 from poker.card import Card, parse_card
 from poker.deck import Deck
 
@@ -25,3 +32,7 @@ def test_deal_removes_cards():
     assert len(hand) == 2
     assert len(deck.cards) == 50
     assert all(c not in deck.cards for c in hand)
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-q"]))

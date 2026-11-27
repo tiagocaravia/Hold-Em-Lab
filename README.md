@@ -194,13 +194,14 @@ python3 bots/arena.py                                  # asks you questions
 python3 bots/arena.py --hands 100000 --save arena.png  # heads-up
 python3 bots/arena.py --hands 20000 --players 6        # 6-player tables
 python3 bots/arena.py --hands 20000 --players 2-9      # a random table size each session
+python3 bots/arena.py --animate risk.gif              # also save an animation of standard deviation and Sharpe ratio
 ```
 
 **The game:** no-limit hold'em, preflop to river, at tables of 2 to 9 (heads-up by default). Blinds are 0.5/1bb, every hand starts at 100bb, the button moves every hand, and side pots are handled. Preflop a player can fold, limp, raise (to 2.5bb) or 3-bet (to 3×). After the flop they check or bet ½, ¾ or 1¼ pot, and facing a bet fold, call or raise. That's at most two bets or raises per street.
 
 **The opponents:** each table plays one session (1,000 hands by default). Every other seat is a randomly nudged version of a preset `Profile` from `poker/profiles.py`: nit, regular, calling station or maniac. Their choices come from the same rules the bots and `advise.py` use to range them, so what a bot assumes about a player and how that player behaves line up. The bot meets every new table knowing nothing, and keeps a separate read and range for each player.
 
-**Real cards, fast:** the first run scores every hand on 10,800 real boards (300 flops × 6 turns × 6 rivers) and builds a preflop table of every hand against every other hand. That takes about 40 seconds with `phevaluator` and is cached in `bots/cache/`. The preflop table matches published equities to within about half a point (AA vs a random hand: 85.4%, published 85.2%). Heads-up, 100,000 hands take about 45 seconds per bot; a 6-player table is about 20× slower per hand.
+**Real cards, fast:** the first run scores every hand on 10,800 real boards (300 flops × 6 turns × 6 rivers) and builds a preflop table of every hand against every other hand. That takes about 40 seconds with `phevaluator` and is cached in `bots/cache/`. The preflop table matches published equities to within about half a point (AA vs a random hand: 85.4%, published 85.2%). The arena plays on every CPU core, splitting the hands into blocks of whole sessions (every bot gets the same blocks, so they still play identical hands). Heads-up, 100,000 hands took about 75 seconds for all three bots on a 15-core Mac, about 5½× faster than on one core; the ML bot is the slowest, about 8× slower per hand than the hand-built bots, and a 6-player table is several times slower per hand than heads-up. Because the hands are split by core count, the same seed deals the same hands only on machines with the same number of cores.
 
 **Bot versions,** all playing exactly the same deals and opponent choices:
 
@@ -209,6 +210,15 @@ python3 bots/arena.py --hands 20000 --players 2-9      # a random table size eac
 * **ML bot:** the trained bot, when one is saved.
 
 Even "no read" profits, because these opponents fold too much preflop and call too much after. A bot that checks when it can and folds to any bet loses about 38 bb/100 (its blinds), so the accounting is sound. The number that matters is each bot's **edge over "no read" on the same hands**, which the arena reports with a 95% interval, overall and by how many hands into a new table it is.
+
+### Risk: standard deviation and Sharpe ratio
+
+Win rate alone hides how bumpy the ride is. After the win rates the arena prints, for each bot (overall and by opponent type):
+
+* **σ per hand:** the standard deviation of a hand's result in bb, and per 100 hands (σ × 10, since hands are independent).
+* **Sharpe ratio:** mean ÷ σ, how much a bot wins for each unit of swing, per hand and per 100 hands (× 10). Its 95% interval allows for poker's fat tails (Mertens' formula, using the results' skew and kurtosis), so it isn't falsely tight.
+
+A second figure (`NAME_risk.png` with `--save NAME.png`) shows the running σ, the running Sharpe ratio with its interval, and a histogram of per-hand results, which shows the swings come from the rare stacks won and lost. `--animate risk.gif` saves the same three panels growing hand by hand. The code is in `bots/risk.py`.
 
 ### Training the ML bot
 
@@ -398,13 +408,14 @@ holdem-lab/
 │   ├── pool.py                # scores every hand on 10,800 real boards, flop to river, cached
 │   ├── ml_agent.py            # the bot: hand-built versions + the ML bot
 │   ├── arena.py               # the table (2-9 seats, side pots); plays bot versions against random opponents
+│   ├── risk.py                # standard deviation and Sharpe ratio per hand: report, plot, animation
 │   ├── train.py               # trains the ML bot, tests on held-out opponents
 │   ├── explain.py             # what the ML bot relies on, its bet-size tell, training animation
 │   └── interface.py           # the plug-in bot: Bot.act(GameState) for game engines and competitions
 ├── accuracy/                  # 4. accuracy
 │   ├── validate.py            # sim vs exact / published equity
 │   └── convergence.py         # how many sims is enough, with animation
-├── tests/                     # pytest: cards, hand ranking, equity sanity checks
+├── tests/                     # pytest: cards, hand ranking, equity, risk stats
 └── poker/                     # the engine everything above uses
     ├── card.py, deck.py       # cards and deck
     ├── evaluator.py           # hand ranking

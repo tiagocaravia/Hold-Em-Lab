@@ -5,11 +5,13 @@ import os
 import random
 import sys
 import time
+from multiprocessing import Pool as Workers
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # so "poker" imports work
 
 import numpy as np
 
+from bots import risk
 from bots.ml_agent import PREFLOP_SIZES, STREETS, Spot, lineup
 from bots.pool import load
 from poker.profiles import PRESETS, bet_weights, call_weights, preflop_weights, raise_weights, random_profile
@@ -346,18 +348,24 @@ def parse_players(text): # "6" -> 6, "2-6" -> (2, 6): a table size, or a range f
     return players
 
 
-def run(hands, session_len, seed, show_plot=True, save=None, players=2):
-    pool = load()
+def run(hands, session_len, seed, show_plot=True, save=None, players=2, animate=None):
+    load()  # builds the cache on the first run, before the workers need it
     size = f"{players}" if isinstance(players, int) else f"{players[0]}-{players[1]}"
-    print(f"\n=== Arena: {hands:,} hands at {size}-player tables, new opponents every {session_len:,} hands ===")
+    print(f"\n=== Arena: {hands:,} hands at {size}-player tables, new opponents every {session_len:,} hands, "
+          f"on {os.cpu_count()} cores ===")
     all_results = {}
-    for agent in lineup():
-        start = time.time()
-        all_results[agent.name] = play(agent, pool, hands, session_len, seed, players=players)
-        print(f"  {agent.name:<18} done in {time.time() - start:.1f}s")
+    with Workers() as workers:
+        for name, make in lineup():
+            start = time.time()
+            all_results[name] = play_parallel(workers, make, hands, session_len, seed, players=players)[0]
+            print(f"  {name:<18} done in {time.time() - start:.1f}s")
     report(all_results, session_len)
+    risk.report(all_results)
     if show_plot:
         plot(all_results, session_len, save)
+        risk.plot(all_results, risk.path(save))
+    if animate:
+        risk.animate(all_results, animate)
 
 
 def _players_error(text):
@@ -369,7 +377,7 @@ def _players_error(text):
 
 def interactive():
     print("=== Bot arena ===  (enter keeps the value in brackets)\n")
-    hands, session_len, seed, show, players = 100000, 1000, 1, True, "2"
+    hands, session_len, seed, show, players, anim = 100000, 1000, 1, True, "2", "none"
     while True:
         players = ask("Players per table, the bot included (2-9, or a range like 2-6)", players, str,
                       lambda t: _players_error(t))
@@ -377,8 +385,9 @@ def interactive():
         session_len = ask("Hands per opponent before switching", session_len, int,
                           lambda n: None if n >= 10 else "At least 10.")
         seed = ask("Random seed", seed, int)
-        show = yes("Show the plot? (y/n)", show)
-        run(hands, session_len, seed, show, players=parse_players(players))
+        show = yes("Show the plots? (y/n)", show)
+        anim = ask("Save a risk animation? (file name like risk.gif, or none)", anim)
+        run(hands, session_len, seed, show, players=parse_players(players), animate=None if anim == "none" else anim)
         if not again():
             break
 
@@ -391,8 +400,11 @@ def main():
     parser.add_argument("--hands", type=int, default=100000, help="Hands each bot plays")
     parser.add_argument("--session", type=int, default=1000, help="Hands per opponent before a new one")
     parser.add_argument("--seed", type=int, default=1, help="Random seed")
-    parser.add_argument("--save", default=None, help="Save the plot to this file instead of showing it")
-    parser.add_argument("--no-plot", action="store_true", help="Skip the plot")
+    parser.add_argument("--save", default=None,
+                        help="Save the plots to this file (and NAME_risk.png) instead of showing them")
+    parser.add_argument("--no-plot", action="store_true", help="Skip the plots")
+    parser.add_argument("--animate", default=None, metavar="FILE.gif",
+                        help="Also save an animation of standard deviation and Sharpe ratio as hands add up")
     parser.add_argument("--players", default="2", metavar="N or LO-HI",
                         help="Players per table, the bot included: 6, or 2-6 for a random size each session (2-9)")
     args = parser.parse_args()
@@ -400,7 +412,7 @@ def main():
         players = parse_players(args.players)
     except ValueError as e:
         sys.exit(f"--{e}")
-    run(args.hands, args.session, args.seed, not args.no_plot, args.save, players)
+    run(args.hands, args.session, args.seed, not args.no_plot, args.save, players, args.animate)
 
 
 if __name__ == "__main__":
