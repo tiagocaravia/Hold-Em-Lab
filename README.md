@@ -35,8 +35,10 @@ Every script asks for its inputs if you run it with no options. After each resul
 Needs Python 3.10 or newer.
 
 ```bash
-pip install matplotlib pandas scikit-learn phevaluator
+pip install -r requirements.txt
 ```
+
+Run the tests with `python3 -m pytest tests`.
 
 (numpy and Pillow, used by the convergence animation, come with these.)
 
@@ -387,6 +389,8 @@ What this lab doesn't do, or does only roughly. Most of it comes down to one thi
 ```
 holdem-lab/
 ├── README.md
+├── LICENSE                    # MIT
+├── requirements.txt           # pip install -r requirements.txt
 ├── hand_analysis.py           # 1. equity: how often your hand wins
 ├── advise.py                  # 2. decisions: play / call / fold, pot odds, ranging
 ├── play.py                    # play the trained bot, the hand-built bot or presets, 2 to 9 players
@@ -400,6 +404,7 @@ holdem-lab/
 ├── accuracy/                  # 4. accuracy
 │   ├── validate.py            # sim vs exact / published equity
 │   └── convergence.py         # how many sims is enough, with animation
+├── tests/                     # pytest: cards, hand ranking, equity sanity checks
 └── poker/                     # the engine everything above uses
     ├── card.py, deck.py       # cards and deck
     ├── evaluator.py           # hand ranking
